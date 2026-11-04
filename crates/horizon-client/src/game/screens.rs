@@ -36,7 +36,8 @@ impl Screen {
             | Self::Dead
             | Self::CommandBlock
             | Self::BlockEditor
-            | Self::Mod => false,
+            | Self::Mod
+            | Self::Fabric => false,
             // WinScreen.extractBackground: the poem fills the screen with the End portal, the
             // credits alone blur. Game::menu_blur knows which one rolls.
             Self::Win => false,
@@ -226,6 +227,14 @@ impl Game<'_> {
                     .clone()?,
             ),
         }
+    }
+
+    /// Rows the pause grid holds beyond its five: a server dialog or links row,
+    /// and the guest profile settings. Host-placed mod widgets need them to
+    /// find the grid's origin.
+    pub(super) fn pause_extra_rows(&self) -> u8 {
+        let row3 = !self.server_links().is_empty() || self.pause_screen_additions().is_some();
+        u8::from(row3) + u8::from(self.options.split_guest || self.split_hud.menu)
     }
 
     /// Singleplayer also has a connection, backed by the integrated server.

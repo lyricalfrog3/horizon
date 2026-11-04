@@ -122,6 +122,7 @@ impl Game<'_> {
         self.options_from_title = from_title;
         self.options_to_game = false;
         let minecart_improvements = self.minecart_improvements();
+        super::fabric_bridge::populate_fabric_mods(&mut self.settings.mods);
         let ui = &mut self.ui.options;
         ui.open_at(!from_title && self.title.is_none(), page);
         ui.minecart_improvements = minecart_improvements;
@@ -411,6 +412,7 @@ impl Game<'_> {
     pub(super) fn load_language(&mut self, code: &str) {
         let root = self.options.resources.clone();
         lang::set(lang::Language::load(&[&root], code));
+        super::fabric_bridge::sync_fabric_translations();
         self.refresh_remote_language();
         self.ui.chat.rescale(&self.gui.atlas);
         self.creative_screen.forget_items();

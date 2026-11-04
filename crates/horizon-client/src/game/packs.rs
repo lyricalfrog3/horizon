@@ -407,6 +407,7 @@ impl Game<'_> {
         } else {
             lang::Language::load(&[&root], &code)
         });
+        super::fabric_bridge::sync_fabric_translations();
         self.refresh_remote_language();
         self.audio.reload_with(&root, sounds);
         self.clear_lod();

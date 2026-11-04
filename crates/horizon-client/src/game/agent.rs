@@ -429,6 +429,7 @@ impl Game<'_> {
             Screen::Win => "win",
             Screen::DebugOptions => "debug-options",
             Screen::Mod => "mod",
+            Screen::Fabric => "fabric",
         }
     }
     pub(super) fn inventory_counts(&self) -> BTreeMap<String, i64> {

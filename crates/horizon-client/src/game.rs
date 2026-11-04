@@ -123,6 +123,7 @@ mod events;
 mod execution_role;
 mod explosion;
 mod extras;
+mod fabric_bridge;
 mod falling_damage;
 mod fangs;
 mod fireworks;
@@ -805,6 +806,9 @@ enum Screen {
     /// A screen of a native mod's own (`native_mod_screen_open`): it draws and
     /// takes its input through the screen hooks.
     Mod,
+    /// A screen installed by a Fabric mod through `Minecraft.gui.setScreen`:
+    /// its `GuiGraphicsExtractor` display list is replayed by the host.
+    Fabric,
 }
 impl Screen {
     /// The id native mods see for this screen (`NativeScreenView.id`, the
@@ -833,6 +837,7 @@ impl Screen {
             Screen::Win => "win",
             Screen::DebugOptions => "debug_options",
             Screen::Mod => "mod",
+            Screen::Fabric => "fabric",
         }
     }
 }
@@ -2399,6 +2404,12 @@ struct Game<'a> {
     /// `horizon-ctl gpu-passes`: time Horizon's own passes on the GPU with F3 shut.
     gpu_passes: bool,
     screen: Screen,
+    /// The native screen a Fabric screen opened over (a mod's menu button on
+    /// the pause screen, later the title/options screens). `None` when the
+    /// Fabric screen replaced gameplay.
+    fabric_return: Option<Screen>,
+    /// A Fabric screen is open over the post-handoff title screen.
+    title_fabric: bool,
     observed_screen: Option<native_hooks::ObservedScreen>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -7219,6 +7230,7 @@ impl Game<'_> {
         self.tick_debug_keys()?;
         self.tick_debug_charts();
         self.tick_tutorial();
+        self.fabric_screen_tick();
         if self.screen == Screen::Creative {
             self.refresh_creative_tabs();
             // CreativeModeInventoryScreen.containerTick: a player without
@@ -8098,6 +8110,20 @@ impl Game<'_> {
             }
         }
         if self.title.is_some() {
+            if self.title_fabric {
+                if !fabric_bridge::fabric_screen_open() {
+                    self.title_fabric = false;
+                } else {
+                    let draws =
+                        fabric_bridge::fabric_screen_draws(batch.width as i32, batch.height as i32);
+                    fabric_bridge::replay_fabric_draws(&mut batch, &self.gui.atlas, draws);
+                    self.draw_toasts(&mut batch, false);
+                    self.draw_tutorial_toasts(&mut batch, false);
+                    self.draw_pack_toasts(&mut batch, false);
+                    self.draw_music_toast(&mut batch, false);
+                    return batch;
+                }
+            }
             // TitleScreen.extractRenderState, then ToastManager over it: vanilla
             // draws the toast manager on every screen, so a pack download or a
             // resource-reload failure still shows on the title (#4428).
@@ -8108,6 +8134,15 @@ impl Game<'_> {
                     &mut batch,
                     self.cursor,
                     self.settings.file.bool("hideSplashTexts"),
+                );
+            }
+            if self.title.as_ref().is_some_and(|t| t.on_main_menu()) {
+                fabric_bridge::draw_menu_widgets(
+                    &mut batch,
+                    &self.gui.atlas,
+                    self.cursor,
+                    hfc_runtime::minecraft::MenuKind::Title,
+                    0,
                 );
             }
             // ScreenEvent.Render.Post over the title's own screens: a mod draws
@@ -8384,7 +8419,10 @@ impl Game<'_> {
             self.screen
         };
         match screen {
-            Screen::Paused if self.pause_menu => self.draw_pause_menu(&mut batch),
+            Screen::Paused if self.pause_menu => {
+                self.draw_pause_menu(&mut batch);
+                self.draw_fabric_pause_widgets(&mut batch);
+            }
             // PauseScreen(false): only its title, at the top.
             Screen::Paused => {
                 let title = self.translate("menu.paused", "Game Paused");
@@ -8406,6 +8444,7 @@ impl Game<'_> {
             Screen::Stats => self.draw_stats(&mut batch),
             Screen::Advancements => self.draw_advancements(&mut batch),
             Screen::Mod => {}
+            Screen::Fabric => self.draw_fabric_screen(&mut batch),
             Screen::WorldOptions => self.draw_world_options(&mut batch),
             Screen::Friends => self.draw_friends_screen(&mut batch),
             Screen::Social => self.draw_social_screen(&mut batch),
@@ -11674,6 +11713,7 @@ impl Game<'_> {
             Action::Credits => {
                 self.open_options_at(true, horizon_client::options_ui::Page::Credits)
             }
+            Action::Mods => self.open_options_at(true, horizon_client::options_ui::Page::Mods),
             Action::OpenUri(uri) => packs::open_uri(&uri),
             Action::CopyText(text) => {
                 use horizon_client::clipboard::Clipboard;
@@ -15800,6 +15840,14 @@ impl Game<'_> {
     }
     /// A key press while a world is open (keyboard or control socket).
     fn key_pressed(&mut self, key: KeyCode) -> Result<()> {
+        if self.screen == Screen::Fabric {
+            if key == KeyCode::Escape {
+                self.fabric_screen_close();
+            } else {
+                self.fabric_screen_key(key, true);
+            }
+            return Ok(());
+        }
         if self.sleeping.is_some()
             && self.screen == Screen::Playing
             && !matches!(
@@ -15860,6 +15908,7 @@ impl Game<'_> {
                 Screen::Win => self.close_win_screen()?,
                 Screen::DebugOptions => self.close_debug_options(),
                 Screen::Mod => self.close_mod_screen(),
+                Screen::Fabric => self.fabric_screen_close(),
             },
             // `checkHotbarKeyPressed`: the keys the controls bind to the off
             // hand and the hotbar slots, so a rebound key swaps instead of
@@ -16698,6 +16747,69 @@ impl Game<'_> {
         }
     }
     fn handle_window_event_inner(&mut self, event_loop: &dyn EventLoopCtl, mut event: WindowEvent) {
+        if self.title_fabric {
+            match &event {
+                WindowEvent::KeyboardInput {
+                    event: key_event, ..
+                } => {
+                    if let PhysicalKey::Code(key) = key_event.physical_key {
+                        if key == KeyCode::Escape && key_event.state == ElementState::Pressed {
+                            fabric_bridge::fabric_screen_close_current();
+                            if !fabric_bridge::fabric_screen_open() {
+                                self.title_fabric = false;
+                            }
+                        } else {
+                            fabric_bridge::fabric_screen_key(
+                                key,
+                                key_event.state == ElementState::Pressed,
+                            );
+                        }
+                    }
+                    if key_event.state == ElementState::Pressed
+                        && let Some(text) = key_event.text.as_deref()
+                    {
+                        for c in text.chars().filter(|c| !c.is_control()) {
+                            fabric_bridge::fabric_screen_char(c);
+                        }
+                    }
+                    return;
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    if let Some(renderer) = &self.renderer {
+                        let batch = HudBatch::new([renderer.config.width, renderer.config.height]);
+                        self.cursor = (
+                            position.x as f32 / batch.scale,
+                            position.y as f32 / batch.scale,
+                        );
+                    }
+                    fabric_bridge::fabric_screen_mouse_moved(self.cursor.0, self.cursor.1);
+                    return;
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    fabric_bridge::fabric_screen_mouse(
+                        *button,
+                        self.cursor.0,
+                        self.cursor.1,
+                        *state == ElementState::Pressed,
+                    );
+                    if !fabric_bridge::fabric_screen_open() {
+                        self.title_fabric = false;
+                    }
+                    return;
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let (dx, dy) = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => (*x, *y),
+                        MouseScrollDelta::PixelDelta(p) => {
+                            ((p.x / 30.0) as f32, (p.y / 30.0) as f32)
+                        }
+                    };
+                    fabric_bridge::fabric_screen_scroll(self.cursor.0, self.cursor.1, dx, dy);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if let WindowEvent::Focused(false) = &event {
             self.physical_keys.clear();
             self.physical_buttons.clear();
@@ -17099,6 +17211,10 @@ impl Game<'_> {
                         let b = HudBatch::new([r.config.width, r.config.height]);
                         let previous = self.cursor;
                         self.cursor = (position.x as f32 / b.scale, position.y as f32 / b.scale);
+                        if self.screen == Screen::Fabric {
+                            self.fabric_screen_mouse_moved();
+                            return Ok(());
+                        }
                         if self.screen_mouse_dragged(previous) {
                             return Ok(());
                         }
@@ -17177,6 +17293,10 @@ impl Game<'_> {
                         if canceled {
                             return Ok(());
                         }
+                    }
+                    if self.screen == Screen::Fabric {
+                        self.fabric_screen_scroll(scaled(raw_x), scaled(raw_y));
+                        return Ok(());
                     }
                     if self.dialog_open() {
                         self.dialog_scroll(d);
@@ -17322,6 +17442,9 @@ impl Game<'_> {
                     }
                 }
                 WindowEvent::MouseInput { .. } if self.screen == Screen::Win => {}
+                WindowEvent::MouseInput { state, button, .. } if self.screen == Screen::Fabric => {
+                    self.fabric_screen_mouse(button, state == ElementState::Pressed);
+                }
                 WindowEvent::MouseInput { state, button, .. } if self.screen == Screen::Options => {
                     if self.options_waiting_for_key() && state == ElementState::Pressed {
                         self.options_bind_mouse(button)?;
@@ -17353,6 +17476,21 @@ impl Game<'_> {
                         .map(|r| [r.config.width, r.config.height])
                         .unwrap_or([1, 1]);
                     let b = HudBatch::new(size);
+                    if self.title.as_ref().is_some_and(|t| t.on_main_menu())
+                        && fabric_bridge::menu_widget_press(
+                        hfc_runtime::minecraft::MenuKind::Title,
+                        0,
+                        b.width,
+                        b.height,
+                        self.cursor,
+                        1,
+                        true,
+                    ) {
+                        if fabric_bridge::fabric_screen_open() {
+                            self.title_fabric = true;
+                        }
+                        return Ok(());
+                    }
                     let atlas = &self.gui.atlas;
                     let shift = self.has_shift_down();
                     let (action, sound) = self.title.as_mut().map_or((Action::None, false), |t| {
@@ -17475,7 +17613,11 @@ impl Game<'_> {
                         Screen::Paused
                             if pressed && button == MouseButton::Left && self.pause_menu =>
                         {
-                            self.pause_click()?
+                            // A mod's mixin-added pause widget takes the click
+                            // first; a miss falls through to the native menu.
+                            if !self.fabric_pause_widget_press() {
+                                self.pause_click()?
+                            }
                         }
                         Screen::WorldOptions if pressed && button == MouseButton::Left => {
                             self.world_options_click()
@@ -18350,6 +18492,8 @@ impl<'a> Game<'a> {
             gpu_passes: false,
             screen: Screen::Playing,
             observed_screen: None,
+            fabric_return: None,
+            title_fabric: false,
             window: None,
             renderer: None,
             last_device_recovery: None,
@@ -19591,6 +19735,7 @@ fn load_resources(
             &[&root],
             &settings.language,
         ));
+        fabric_bridge::sync_fabric_translations();
     }
     progress.set(5);
     let resources = Resources {
@@ -20371,6 +20516,8 @@ struct Loading {
     /// (`ready_for_handoff`).
     ui_at: Option<Instant>,
     title_drawn: bool,
+    /// A Fabric screen is open over the pre-world title menu.
+    startup_fabric: bool,
     menu: startup_menu::StartupMenu,
     error: Option<Box<dyn std::error::Error>>,
 }
@@ -20794,6 +20941,7 @@ fn run_loading(
         shown: false,
         ui_at: None,
         title_drawn: false,
+        startup_fabric: false,
         menu,
         error: None,
     };
@@ -20895,6 +21043,7 @@ pub fn run_with() -> Result<()> {
     }
     mods::register_components(&vanilla_root)?;
     mods::register_standalone_models();
+    fabric_bridge::init_fabric_bridge();
     let early_settings = Settings::load(&Game::options_path());
     // Minecraft's constructor opens the narrator; a server has none.
     if options.execution_role.is_client() {

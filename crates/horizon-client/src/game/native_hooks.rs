@@ -3464,6 +3464,12 @@ impl Game<'_> {
         let Some(text) = text else {
             return;
         };
+        if self.screen == Screen::Fabric {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                self.fabric_screen_char(c);
+            }
+            return;
+        }
         let Some(screen) = self.screen_view_now() else {
             return;
         };
@@ -5765,6 +5771,7 @@ impl Game<'_> {
     /// hides. API 12.
     pub(super) fn native_tooltip(&self, stack: &ItemStack, lines: &mut Vec<(Text, u32)>) {
         mod_api::dispatch_tooltip(self, mod_api::mods(), stack, lines);
+        self.fabric_tooltip(stack, lines);
     }
     /// Change a tooltip box's background and border gradient colors, as ARGB.
     /// Stack is None for tooltips not associated with an item.
@@ -5783,6 +5790,7 @@ impl Game<'_> {
             border_top,
             border_bottom,
         );
+        self.fabric_tooltip_color(stack, background, border_top, border_bottom);
     }
     /// Client-side image component for this stack's tooltip. Answer its width/height
     /// in GUI pixels; finite positive dimensions reserve space after text and any
@@ -6147,6 +6155,7 @@ impl Game<'_> {
         canceled: &mut bool,
     ) {
         mod_api::dispatch_right_click_block(self, mod_api::mods(), pos, face, canceled);
+        self.fabric_right_click_block(pos, face, canceled);
     }
     /// An explosion at `center` in `dimension` (`minecraft:overworld`) is
     /// about to break `blocks`: `ServerExplosion.explode` with its `toBlow`,

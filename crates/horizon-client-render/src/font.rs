@@ -919,6 +919,30 @@ impl Font {
     pub fn take_patches(&self) -> Vec<Patch> {
         std::mem::take(&mut self.cache.borrow_mut().region.pending)
     }
+    /// Place an RGBA8 image in the run-time region of the atlas and return the
+    /// atlas rect to draw it with. A mod's registered texture (an icon loaded
+    /// from its jar) has no slot in the packed atlas, so the host uploads it
+    /// through the same patch path as a glyph. `None` when the region is full.
+    pub fn place_image(&self, width: u32, height: u32, rgba: Vec<u8>) -> Option<Rect> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let (atlas_width, atlas_height) = self.atlas;
+        let (ax, ay) = {
+            let mut cache = self.cache.borrow_mut();
+            cache
+                .region
+                .place(width, height, rgba, self.atlas, self.region)?
+        };
+        Some(Rect {
+            u0: ax as f32 / atlas_width as f32,
+            v0: ay as f32 / atlas_height as f32,
+            u1: (ax + width) as f32 / atlas_width as f32,
+            v1: (ay + height) as f32 / atlas_height as f32,
+            w: width,
+            h: height,
+        })
+    }
     pub fn advance(&self, c: char, style: &Style) -> f32 {
         if c == '\u{fffc}' && style.inline_object.is_some() {
             return 8.0;

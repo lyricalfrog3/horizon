@@ -396,7 +396,7 @@ impl Floods {
 static LOGGER: std::sync::OnceLock<Logger> = std::sync::OnceLock::new();
 
 fn ours(target: &str) -> bool {
-    target.starts_with("horizon")
+    target.starts_with("horizon") || target.starts_with("hfc")
 }
 
 impl log::Log for Logger {

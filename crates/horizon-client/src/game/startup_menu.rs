@@ -93,6 +93,7 @@ impl StartupMenu {
             &[&root],
             &settings.language,
         ));
+        super::fabric_bridge::sync_fabric_translations();
         self.root = root;
         if self.title.is_none() {
             let mut title = Title::new(
@@ -495,6 +496,7 @@ impl Loading {
     }
 
     fn open_menu_options(&mut self, page: Page) {
+        super::fabric_bridge::populate_fabric_mods(&mut self.settings.mods);
         self.menu.options.open_at(false, page);
         self.menu.options.languages = horizon_client::lang::available(&[&self.menu.root]);
         self.menu.options.pack_infos = packs::pack_infos(&self.vanilla_root, &[]);
@@ -524,6 +526,7 @@ impl Loading {
                         &[&self.menu.root],
                         &code,
                     ));
+                    super::fabric_bridge::sync_fabric_translations();
                     self.save_menu_settings();
                 }
                 Event::Packs(_) => {
@@ -675,6 +678,7 @@ impl Loading {
             Action::Language => self.open_menu_options(Page::Language),
             Action::Sounds => self.open_menu_options(Page::Sound),
             Action::Credits => self.open_menu_options(Page::Credits),
+            Action::Mods => self.open_menu_options(Page::Mods),
             Action::OpenUri(uri) => super::packs::open_uri(&uri),
             Action::CopyText(text) => {
                 use horizon_client::clipboard::Clipboard;
@@ -898,6 +902,72 @@ impl Loading {
         event_loop: &dyn EventLoopCtl,
         event: WindowEvent,
     ) -> Result<()> {
+        if self.startup_fabric {
+            match &event {
+                WindowEvent::KeyboardInput {
+                    event: key_event, ..
+                } => {
+                    if let PhysicalKey::Code(key) = key_event.physical_key {
+                        if key == KeyCode::Escape && key_event.state == ElementState::Pressed {
+                            fabric_bridge::fabric_screen_close_current();
+                            if !fabric_bridge::fabric_screen_open() {
+                                self.startup_fabric = false;
+                            }
+                        } else {
+                            fabric_bridge::fabric_screen_key(
+                                key,
+                                key_event.state == ElementState::Pressed,
+                            );
+                        }
+                    }
+                    if key_event.state == ElementState::Pressed
+                        && let Some(text) = key_event.text.as_deref()
+                    {
+                        for c in text.chars().filter(|c| !c.is_control()) {
+                            fabric_bridge::fabric_screen_char(c);
+                        }
+                    }
+                    return Ok(());
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.menu.pointer = (position.x, position.y);
+                    self.update_menu_cursor();
+                    fabric_bridge::fabric_screen_mouse_moved(
+                        self.menu.cursor.0,
+                        self.menu.cursor.1,
+                    );
+                    return Ok(());
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    fabric_bridge::fabric_screen_mouse(
+                        *button,
+                        self.menu.cursor.0,
+                        self.menu.cursor.1,
+                        *state == ElementState::Pressed,
+                    );
+                    if !fabric_bridge::fabric_screen_open() {
+                        self.startup_fabric = false;
+                    }
+                    return Ok(());
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let (dx, dy) = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => (*x, *y),
+                        MouseScrollDelta::PixelDelta(p) => {
+                            ((p.x / 30.0) as f32, (p.y / 30.0) as f32)
+                        }
+                    };
+                    fabric_bridge::fabric_screen_scroll(
+                        self.menu.cursor.0,
+                        self.menu.cursor.1,
+                        dx,
+                        dy,
+                    );
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         if let WindowEvent::KeyboardInput { event, .. } = &event
             && let PhysicalKey::Code(key) = event.physical_key
         {
@@ -1031,6 +1101,23 @@ impl Loading {
                 ..
             } => {
                 let batch = HudBatch::new(self.menu_size());
+                if state == ElementState::Pressed
+                    && self.menu.title.as_ref().is_some_and(|t| t.on_main_menu())
+                    && fabric_bridge::menu_widget_press(
+                        hfc_runtime::minecraft::MenuKind::Title,
+                        0,
+                        batch.width,
+                        batch.height,
+                        self.menu.cursor,
+                        1,
+                        true,
+                    )
+                {
+                    if fabric_bridge::fabric_screen_open() {
+                        self.startup_fabric = true;
+                    }
+                    return Ok(());
+                }
                 if let (Some(title), Some(gui)) = (&mut self.menu.title, &self.gui) {
                     if state == ElementState::Released {
                         title.release();
@@ -1122,6 +1209,16 @@ impl Loading {
             horizon_client::ui_theme::draw_boot(&self.boot, batch, &logs);
             return;
         };
+        if self.startup_fabric {
+            if !fabric_bridge::fabric_screen_open() {
+                self.startup_fabric = false;
+            } else {
+                let draws =
+                    fabric_bridge::fabric_screen_draws(batch.width as i32, batch.height as i32);
+                fabric_bridge::replay_fabric_draws(batch, &gui.atlas, draws);
+                return;
+            }
+        }
         if self.menu.pending.is_some() {
             horizon_client::level_loading::draw_loading_overlay(
                 batch,
@@ -1169,6 +1266,15 @@ impl Loading {
                 self.menu.cursor,
                 self.settings.file.bool("hideSplashTexts"),
             );
+            if title.on_main_menu() {
+                fabric_bridge::draw_menu_widgets(
+                    batch,
+                    &gui.atlas,
+                    self.menu.cursor,
+                    hfc_runtime::minecraft::MenuKind::Title,
+                    0,
+                );
+            }
         }
         if let Some(focus) = self.menu.key_focus
             && self.menu.pending.is_none()

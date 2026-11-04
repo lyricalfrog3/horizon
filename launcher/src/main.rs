@@ -1027,6 +1027,26 @@ impl Launcher {
                             self.client_error = Some(e);
                             continue;
                         }
+                        // Convert and install Fabric jars before the game reads
+                        // `horizon-mods`. HFC is a separate program: no marker,
+                        // no work. A failure is reported but does not stop the
+                        // launch; the game still starts with what is installed.
+                        let hfc_home = cmd
+                            .get_current_dir()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(backend::game_home);
+                        if let Some(result) = horizon_launcher::fabric_compat::bootstrap(&hfc_home)
+                        {
+                            match result {
+                                Ok(line) => self.prepare_log.push_back(line),
+                                Err(e) => {
+                                    self.prepare_log.push_back(e.clone());
+                                    if self.client_error.is_none() {
+                                        self.client_error = Some(e);
+                                    }
+                                }
+                            }
+                        }
                         if let Some(code) = self.joining.take() {
                             if let Err(e) = backend::join_friend(&mut cmd, &code) {
                                 self.client_error = Some(e);

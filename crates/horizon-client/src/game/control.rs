@@ -200,6 +200,16 @@ impl Game<'_> {
     /// taken one, not the characters `\` and `b`. `Err` when no text box of
     /// the screen takes it.
     pub(super) fn type_into_screen(&mut self, text: &str) -> Result<()> {
+        if self.screen == Screen::Fabric {
+            if text == "\\b" {
+                self.fabric_screen_key(winit::keyboard::KeyCode::Backspace, true);
+            } else {
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    self.fabric_screen_char(c);
+                }
+            }
+            return Ok(());
+        }
         if text == "\\b" {
             match self.screen {
                 Screen::WorldOptions => {
@@ -452,6 +462,15 @@ impl Game<'_> {
                 ok()
             }
             "pad" => Ok(Some(self.pad_command(&words)?)),
+            "fabric-key" => {
+                self.require_world()?;
+                let name = arg(1)?;
+                if self.fabric_press_key_mapping(name) {
+                    ok()
+                } else {
+                    Err(format!("no Fabric key mapping {name}").into())
+                }
+            }
             "key" => {
                 let key = key_code(arg(1)?).ok_or_else(|| format!("unknown key {}", words[1]))?;
                 let action = arg(2)?;
@@ -1132,6 +1151,7 @@ impl Game<'_> {
             Screen::Win => "win",
             Screen::DebugOptions => "debug-options",
             Screen::Mod => "mod",
+            Screen::Fabric => "fabric",
         }
     }
 

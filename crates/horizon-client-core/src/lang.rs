@@ -24,7 +24,7 @@ impl LanguageInfo {
         format!("{} ({})", self.name, self.region)
     }
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Language {
     pub code: String,
     /// `LanguageInfo.bidirectional`: text without a strong character reads
@@ -216,6 +216,9 @@ impl Language {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+    pub fn extend(&mut self, entries: impl IntoIterator<Item = (String, String)>) {
+        self.map.extend(entries);
+    }
 }
 
 /// Languages declared by `pack.mcmeta` files (the vanilla asset root first).
@@ -262,6 +265,19 @@ pub fn available(sources: &[&dyn ResourceSource]) -> Vec<LanguageInfo> {
 pub fn set(language: Language) {
     BIDIRECTIONAL.store(language.bidirectional, Ordering::Relaxed);
     *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(language));
+}
+pub fn extend(entries: impl IntoIterator<Item = (String, String)>) {
+    let mut lock = CURRENT.write().unwrap_or_else(|e| e.into_inner());
+    let mut updated = match lock.as_ref() {
+        Some(curr) => (**curr).clone(),
+        None => Language {
+            code: DEFAULT.to_owned(),
+            bidirectional: false,
+            map: HashMap::new(),
+        },
+    };
+    updated.extend(entries);
+    *lock = Some(Arc::new(updated));
 }
 pub fn current() -> Option<Arc<Language>> {
     if let Some(language) = SCOPE.with(|s| s.borrow().as_ref().map(|s| s.language.clone())) {
@@ -335,6 +351,10 @@ pub fn get_or(key: &str, fallback: &str) -> String {
 }
 pub fn has(key: &str) -> bool {
     current().is_some_and(|l| l.get(key).is_some())
+}
+/// All active translations, for a host boundary that runs its own text stack.
+pub fn entries() -> HashMap<String, String> {
+    current().map(|l| l.map.clone()).unwrap_or_default()
 }
 /// I18n.get with plain string arguments.
 pub fn tr(key: &str, args: &[&dyn std::fmt::Display]) -> String {

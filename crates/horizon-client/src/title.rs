@@ -366,6 +366,7 @@ pub enum Action {
     Options,
     Accessibility,
     Language,
+    Mods,
     /// AccessibilityOnboardingScreen's Music & Sounds button.
     Sounds,
     /// The title's bottom text (`PlainTextButton`): `CreditsAndAttributionScreen`.
@@ -1715,10 +1716,22 @@ impl Title {
                     b(
                         cx - 100.0,
                         y + 48.0,
-                        200.0,
+                        98.0,
                         &lang::get_or("menu.online", "Minecraft Realms"),
                         false,
                         0,
+                    ),
+                    b(
+                        cx + 2.0,
+                        y + 48.0,
+                        98.0,
+                        &if lang::has("modmenu.title") {
+                            lang::get("modmenu.title")
+                        } else {
+                            lang::get("horizon.pages.mods")
+                        },
+                        true,
+                        8,
                     ),
                     b(
                         cx - 100.0,
@@ -2383,6 +2396,16 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         hide_splash: bool,
     ) {
         self.draw_with_items(atlas, None, batch, cursor, hide_splash);
+    }
+    /// Whether the title's own main menu is showing, not one of the screens it
+    /// opens (Select World, Create World, a prompt): host-placed mod widgets
+    /// belong to the main menu alone.
+    pub fn on_main_menu(&self) -> bool {
+        matches!(self.mode, Mode::Main)
+            && !self.preparing
+            && self.rules.borrow().is_none()
+            && self.confirm_experiments.borrow().is_none()
+            && self.experiments.borrow().is_none()
     }
     /// [`Title::draw`] with the item models, which draw the item icons of the
     /// Superflat screens the way `GuiGraphics.renderItem` does.
@@ -3410,6 +3433,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             (Mode::Main, Some(3)) => Action::Options,
             (Mode::Main, Some(7)) => Action::Accessibility,
             (Mode::Main, Some(6)) => Action::Language,
+            (Mode::Main, Some(8)) => Action::Mods,
             (Mode::Select { worlds, selected }, Some(10)) => {
                 match selected.and_then(|i| worlds.get(i)).cloned() {
                     Some(world) => self.play(world),

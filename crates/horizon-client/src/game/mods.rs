@@ -72,6 +72,7 @@ pub(super) fn content_root(
     enabled: &std::collections::BTreeSet<String>,
     dev: &[std::path::PathBuf],
 ) -> std::path::PathBuf {
+    super::fabric_bridge::init_fabric_bridge();
     use horizon_client::mod_content::{self, ContentMod};
     use horizon_mods::{Capability, Content, Package};
     let here = std::env::current_dir().unwrap_or_default();
@@ -372,6 +373,7 @@ impl Game<'_> {
             .collect();
         // A mod with a native version built in says so instead, and isn't news.
         self.list_native_mods();
+        super::fabric_bridge::populate_fabric_mods(&mut self.settings.mods);
         let built = std::env::current_exe()
             .ok()
             .and_then(|exe| std::fs::read_to_string(exe.with_file_name(BUILD_INFO)).ok())
