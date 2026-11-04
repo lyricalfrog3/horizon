@@ -6128,6 +6128,7 @@ impl Game<'_> {
         canceled: &mut bool,
     ) {
         mod_api::dispatch_destroy_block(self, mod_api::mods(), pos, state, canceled);
+        self.fabric_destroy_block(pos, canceled);
     }
     /// A player placed `stack` as the block `state` at `pos`: where
     /// `BlockItem.place` set it, before the stack shrinks. It only hears; a

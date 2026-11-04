@@ -8,6 +8,7 @@ use horizon_client::items::ItemStack;
 use horizon_client::text::Text;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 mod gui;
@@ -22,11 +23,26 @@ pub(super) use gui::{
 };
 pub(super) use menu::{draw_menu_widgets, menu_widget_press};
 
+#[allow(unused_imports)]
+use winit::keyboard::KeyCode;
+
 /// Jars Options > Mods switched off: not loaded, but still listed so the
 /// player can turn them back on.
 fn switched_off_mods() -> &'static Mutex<Vec<hfc_runtime::bridge::JarSummary>> {
     static OFF: OnceLock<Mutex<Vec<hfc_runtime::bridge::JarSummary>>> = OnceLock::new();
     OFF.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The prepared resources (`registries.json`, tags) server-side mods read
+/// block and item ids from; set before the bridge starts.
+static RESOURCES: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set while the bridge itself breaks a block for a mod, so the break does not
+/// raise the block-break event again.
+static BREAKING_FOR_MOD: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn set_fabric_resources(dir: PathBuf) {
+    let _ = RESOURCES.set(dir);
 }
 
 fn get_fabric_bridge() -> &'static Mutex<hfc_runtime::bridge::FabricBridge> {
@@ -82,9 +98,14 @@ fn get_fabric_bridge() -> &'static Mutex<hfc_runtime::bridge::FabricBridge> {
                 }
             }
         }
+        if let Some(resources) = RESOURCES.get() {
+            bridge.load_registries(resources);
+        }
+        bridge.set_game_dir(Some(Game::game_dir()));
         if let Err(e) = bridge.init() {
             log::warn!("Failed to initialize FabricBridge: {e}");
         }
+        bridge.server_starting();
         let report = bridge.class_closure();
         log::info!(
             "Fabric class closure: {} resolved, {} missing",
@@ -266,6 +287,29 @@ impl hfc_runtime::bridge::HostBridge for HostBridgeAdapter<'_, '_> {
     fn give(&mut self, item: &str, count: u32) -> Result<(), String> {
         self.0.native_give(item, count)
     }
+    fn held_item(&self) -> Option<String> {
+        self.0.held().map(|s| s.item.to_string())
+    }
+    fn held_enchantments(&self) -> Vec<(String, i32)> {
+        self.0
+            .held()
+            .map(|s| {
+                s.enchantments()
+                    .iter()
+                    .map(|(id, level)| (id.to_string(), *level as i32))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn break_block(&mut self, pos: [i32; 3]) -> bool {
+        if self.0.native_block(pos) == "minecraft:air" {
+            return false;
+        }
+        BREAKING_FOR_MOD.store(true, Ordering::SeqCst);
+        let broken = self.0.break_block(pos).is_ok();
+        BREAKING_FOR_MOD.store(false, Ordering::SeqCst);
+        broken
+    }
     fn drop_item(&mut self, pos: [i32; 3], item: &str, count: u32) {
         let _ = self.0.native_give(item, count);
         self.0.pop_resource(pos, ItemStack::new(item, count));
@@ -273,6 +317,24 @@ impl hfc_runtime::bridge::HostBridge for HostBridgeAdapter<'_, '_> {
 }
 
 impl Game<'_> {
+    /// `PlayerBlockBreakEvents.BEFORE` for the block at `pos`; a listener that
+    /// returns false cancels the break. Fabric server mods that break more
+    /// blocks (Veinminer) do it through the host's own `break_block`.
+    pub(super) fn fabric_destroy_block(&mut self, pos: [i32; 3], canceled: &mut bool) {
+        if *canceled || BREAKING_FOR_MOD.load(Ordering::SeqCst) {
+            return;
+        }
+        let crouching = self.keys.contains(&KeyCode::ShiftLeft);
+        if let Ok(mut bridge) = get_fabric_bridge().lock() {
+            let mut adapter = HostBridgeAdapter(self);
+            if bridge.block_break_before(&mut adapter, pos, crouching, 8)
+                == hfc_runtime::bridge::Flow::Cancel
+            {
+                *canceled = true;
+            }
+        }
+    }
+
     pub(super) fn fabric_right_click_block(
         &mut self,
         pos: [i32; 3],

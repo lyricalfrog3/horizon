@@ -21043,6 +21043,7 @@ pub fn run_with() -> Result<()> {
     }
     mods::register_components(&vanilla_root)?;
     mods::register_standalone_models();
+    fabric_bridge::set_fabric_resources(options.resources.clone());
     fabric_bridge::init_fabric_bridge();
     let early_settings = Settings::load(&Game::options_path());
     // Minecraft's constructor opens the narrator; a server has none.
