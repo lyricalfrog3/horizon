@@ -2625,6 +2625,10 @@ impl Game<'_> {
         if background.to_be_bytes()[0] == 0 {
             background = 0xf0100010;
         }
+        // A mod's gradient surface is drawn with alpha because it sits on its
+        // own background pass. That pass is not applied here, so an item's
+        // slots and hotbar would show through this solid box.
+        background = (background & 0x00ff_ffff) | 0xff00_0000;
         let convert = |color: u32| {
             let [a, r, g, b] = color.to_be_bytes();
             rgba(r, g, b, a)

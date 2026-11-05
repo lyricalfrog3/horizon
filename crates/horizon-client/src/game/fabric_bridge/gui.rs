@@ -85,15 +85,16 @@ pub(in super::super) fn replay_fabric_draws(
                 y2,
                 color_from,
                 color_to,
+                horizontal,
             } => {
                 let (x, w) = (x1.min(x2) as f32, (x2 - x1).abs() as f32);
                 let (y, h) = (y1.min(y2) as f32, (y2 - y1).abs() as f32);
-                batch.fill_gradient(
-                    atlas,
-                    (x, y, w, h),
-                    abgr(color_from as u32),
-                    abgr(color_to as u32),
-                );
+                let (from, to) = (abgr(color_from as u32), abgr(color_to as u32));
+                if horizontal {
+                    batch.fill_gradient_horizontal(atlas, (x, y, w, h), from, to);
+                } else {
+                    batch.fill_gradient(atlas, (x, y, w, h), from, to);
+                }
             }
             hfc_runtime::minecraft::GuiDraw::Text { text, x, y, color } => {
                 if !text.is_empty() && text != "null" && !text.starts_with("[Object ") {
@@ -109,16 +110,20 @@ pub(in super::super) fn replay_fabric_draws(
             } => {
                 let _ = rotation;
                 if let Some(game) = game {
-                    // The HUD replay has no 3D model transform: draw the item
-                    // through the game's GUI item renderer, centred in the
-                    // requested square.
-                    let offset = ((size - 16).max(0) / 2) as f32;
-                    game.draw_item_model(
-                        batch,
-                        &ItemStack::new(&item, 1),
-                        x as f32 + offset,
-                        y as f32 + offset,
-                    );
+                    // Draw the item through the game's GUI item renderer at
+                    // its 16 px size, then scale what it drew to the requested
+                    // square. The HUD has no 3D model transform, so the Y
+                    // rotation is not applied.
+                    let (x, y) = (x as f32, y as f32);
+                    let start = batch.vertices.len();
+                    game.draw_item_model(batch, &ItemStack::new(&item, 1), x, y);
+                    let scale = size.max(1) as f32 / 16.0;
+                    if scale != 1.0 {
+                        for vertex in &mut batch.vertices[start..] {
+                            vertex.pos[0] = x + (vertex.pos[0] - x) * scale;
+                            vertex.pos[1] = y + (vertex.pos[1] - y) * scale;
+                        }
+                    }
                 }
             }
             hfc_runtime::minecraft::GuiDraw::Blit {

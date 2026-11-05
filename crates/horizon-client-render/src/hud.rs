@@ -1710,14 +1710,34 @@ impl HudBatch {
     pub fn fill_gradient(
         &mut self,
         atlas: &HudAtlas,
-        (x, y, w, h): (f32, f32, f32, f32),
+        rect: (f32, f32, f32, f32),
         top: u32,
         bottom: u32,
+    ) {
+        self.fill_gradient_corners(atlas, rect, [top, top, bottom, bottom]);
+    }
+    /// A gradient from `left` to `right`, across the rectangle (a vertical
+    /// `fillGradient` drawn under a quarter-turn GUI pose).
+    pub fn fill_gradient_horizontal(
+        &mut self,
+        atlas: &HudAtlas,
+        rect: (f32, f32, f32, f32),
+        left: u32,
+        right: u32,
+    ) {
+        self.fill_gradient_corners(atlas, rect, [left, right, right, left]);
+    }
+    /// A rectangle with one colour per corner: top left, top right, bottom
+    /// right, bottom left.
+    fn fill_gradient_corners(
+        &mut self,
+        atlas: &HudAtlas,
+        (x, y, w, h): (f32, f32, f32, f32),
+        c: [u32; 4],
     ) {
         let r = atlas.white;
         let uv = [(r.u0 + r.u1) / 2.0, (r.v0 + r.v1) / 2.0];
         let p = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
-        let c = [top, top, bottom, bottom];
         for i in [0, 1, 2, 0, 2, 3] {
             self.vertices.push(HudVertex {
                 pos: p[i],
