@@ -18,6 +18,7 @@ use crate::{Result, blocks::MAP_COLORS};
 use horizon_core::geometry::{Aabb, Axis, ShapeOp, Vec3, VoxelShape};
 use horizon_mods::content::{
     Block, Content, CreativeTab, EntityType, MenuType, MobEffect, Rarity, StateProperty,
+    TabEntries, TabPlacement,
 };
 use horizon_world::nbt::{self, Compound, JavaString, Limits, Tag};
 use serde::{Deserialize, Serialize, de};
@@ -623,6 +624,8 @@ struct Plan<'a> {
     sounds: BTreeMap<String, J>,
     /// The mods' creative tabs, in mod order.
     tabs: Vec<&'a CreativeTab>,
+    /// The mods' items for existing tabs, in mod order then file order.
+    tab_entries: Vec<&'a TabEntries>,
     /// The mods' English names of their items and blocks (`item.<ns>.<path>`,
     /// `block.<ns>.<path>`), for the search tab.
     names: BTreeMap<String, String>,
@@ -1140,9 +1143,11 @@ impl<'a> Plan<'a> {
         // them together by mod ID and entry name before assigning IDs.
         items.sort_by(|a, b| a.rename.to.cmp(&b.rename.to));
         let mut tabs = Vec::new();
+        let mut tab_entries = Vec::new();
         let mut lang = BTreeMap::new();
         for m in &sorted {
             tabs.extend(m.content.creative_tabs.iter());
+            tab_entries.extend(m.content.tab_entries.iter());
             for ns in &m.content.namespaces {
                 let Ok(bytes) = m.content.file(&format!("assets/{ns}/lang/en_us.json")) else {
                     continue;
@@ -1163,6 +1168,7 @@ impl<'a> Plan<'a> {
             defaults,
             sounds,
             tabs,
+            tab_entries,
             names: lang,
         })
     }
@@ -1636,15 +1642,95 @@ impl<'a> Plan<'a> {
             row.set("items", J::Arr(items));
             tabs.push(row);
         }
-        if let Some(search) = search {
-            let name = |id: &str| {
-                let (ns, path) = id.split_once(':').unwrap_or(("", id));
-                ["item", "block"]
-                    .iter()
-                    .find_map(|kind| self.names.get(&format!("{kind}.{ns}.{path}")))
-                    .cloned()
-                    .unwrap_or_else(|| path.to_owned())
+        let name = |id: &str| {
+            let (ns, path) = id.split_once(':').unwrap_or(("", id));
+            ["item", "block"]
+                .iter()
+                .find_map(|kind| self.names.get(&format!("{kind}.{ns}.{path}")))
+                .cloned()
+                .unwrap_or_else(|| path.to_owned())
+        };
+        // Items the mods put in existing tabs (vanilla's or a mod's, mod tabs
+        // are pushed above): mod order, then file order, so entries after the
+        // same anchor stack up in file order.
+        // Per tab, the item last put after an anchor and how many went to the
+        // start, so a second entry stacks behind the first, not before it.
+        let mut stacked: BTreeMap<(usize, &str), &str> = BTreeMap::new();
+        let mut starts: BTreeMap<usize, usize> = BTreeMap::new();
+        for file in &self.tab_entries {
+            let Some(at) = tabs
+                .iter()
+                .position(|t| matches!(t.get("id"), Some(J::Str(id)) if *id == file.tab))
+            else {
+                log::warn!("Horizon: tab_entries: no creative tab {}", file.tab);
+                continue;
             };
+            for entry in file.entries.iter().filter(|e| known(&e.item)) {
+                let tab = &mut tabs[at];
+                let Some(J::Arr(items)) = tab.get("items") else {
+                    continue;
+                };
+                let find = |anchor: &str| -> Vec<usize> {
+                    let want = stack(anchor);
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, i)| **i == want)
+                        .map(|(i, _)| i)
+                        .collect()
+                };
+                let end = items.len();
+                let place = match &entry.placement {
+                    TabPlacement::End => end,
+                    TabPlacement::Start => starts.get(&at).copied().unwrap_or(0),
+                    TabPlacement::After(a) => {
+                        find(stacked.get(&(at, a.as_str())).unwrap_or(&a.as_str()))
+                            .last()
+                            .map_or_else(
+                                || {
+                                    log::warn!(
+                                        "Horizon: tab_entries: {} is not in {}, {} goes at its end",
+                                        a,
+                                        file.tab,
+                                        entry.item
+                                    );
+                                    end
+                                },
+                                |&i| i + 1,
+                            )
+                    }
+                    TabPlacement::Before(a) => find(a).first().copied().unwrap_or_else(|| {
+                        log::warn!(
+                            "Horizon: tab_entries: {} is not in {}, {} goes at its end",
+                            a,
+                            file.tab,
+                            entry.item
+                        );
+                        end
+                    }),
+                };
+                match &entry.placement {
+                    TabPlacement::Start => *starts.entry(at).or_default() += 1,
+                    TabPlacement::After(a) => {
+                        stacked.insert((at, a.as_str()), entry.item.as_str());
+                    }
+                    _ => {}
+                }
+                // The lists beside `items` (the search tab's) stay in step.
+                for (key, value) in [
+                    ("items", stack(&entry.item)),
+                    ("lines", J::Arr(vec![J::Str(name(&entry.item))])),
+                    ("tags", J::Arr(Vec::new())),
+                ] {
+                    if let Some(J::Arr(list)) = tab.get_mut(key)
+                        && (key == "items" || list.len() == end)
+                    {
+                        list.insert(place.min(list.len()), value);
+                    }
+                }
+            }
+        }
+        if let Some(search) = search {
             let tab = &mut tabs[search];
             for (key, add) in [
                 ("items", new.iter().map(|id| stack(id)).collect::<Vec<_>>()),

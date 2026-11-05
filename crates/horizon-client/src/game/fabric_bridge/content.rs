@@ -8,8 +8,12 @@
 //! the jar's own assets, data and tags in the same namespace, become one
 //! content mod folder per namespace, which the content loader reads like
 //! any other folder mod. The folders are rebuilt at every start.
+//!
+//! Where the mod puts its items in creative tabs (Fabric's
+//! `CreativeModeTabEvents.modifyOutputEvent`) becomes the mod's
+//! `tab_entries` file per tab.
 
-use hfc_runtime::bridge::{FabricModMetadata, RegisteredItem};
+use hfc_runtime::bridge::{CreativeTabAddition, FabricModMetadata, RegisteredItem, TabPlacement};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -19,8 +23,12 @@ const MAX_COPY: u64 = 256 << 20;
 
 /// Writes the generated content mods under `out` and returns their folders.
 pub(in super::super) fn fabric_content_mods(out: &Path) -> Vec<PathBuf> {
-    let (items, mods) = match super::get_fabric_bridge().lock() {
-        Ok(bridge) => (bridge.registered_items(), bridge.loaded_mods().to_vec()),
+    let (items, tabs, mods) = match super::get_fabric_bridge().lock() {
+        Ok(bridge) => (
+            bridge.registered_items(),
+            bridge.creative_tab_additions(),
+            bridge.loaded_mods().to_vec(),
+        ),
         Err(_) => return Vec::new(),
     };
     let _ = std::fs::remove_dir_all(out);
@@ -35,7 +43,16 @@ pub(in super::super) fn fabric_content_mods(out: &Path) -> Vec<PathBuf> {
     }
     let mut folders = Vec::new();
     for (namespace, items) in by_namespace {
-        match write_mod(out, &namespace, &items, &mods) {
+        // The tab placements of this namespace's items, in the mod's order.
+        let tabs: Vec<&CreativeTabAddition> = tabs
+            .iter()
+            .filter(|t| {
+                t.item
+                    .split_once(':')
+                    .is_some_and(|(ns, _)| ns == namespace)
+            })
+            .collect();
+        match write_mod(out, &namespace, &items, &tabs, &mods) {
             Ok(folder) => {
                 log::info!(
                     "Fabric: {} item(s) registered in {namespace}: content mod {}",
@@ -118,6 +135,7 @@ fn write_mod(
     out: &Path,
     namespace: &str,
     items: &[RegisteredItem],
+    tabs: &[&CreativeTabAddition],
     mods: &[FabricModMetadata],
 ) -> Result<PathBuf, String> {
     let owner = owner(namespace, mods).ok_or("no loaded jar holds this namespace")?;
@@ -189,6 +207,38 @@ fn write_mod(
         }
         let text = serde_json::to_vec_pretty(&serde_json::Value::Object(file))
             .map_err(|e| e.to_string())?;
+        std::fs::write(&target, text).map_err(|e| e.to_string())?;
+    }
+    // One `tab_entries` file per tab, entries in the order the mod made them.
+    let mut by_tab: BTreeMap<&str, Vec<serde_json::Value>> = BTreeMap::new();
+    for addition in tabs {
+        let mut entry = serde_json::Map::new();
+        entry.insert("item".into(), addition.item.clone().into());
+        match &addition.placement {
+            TabPlacement::End => {}
+            TabPlacement::Start => {
+                entry.insert("start".into(), true.into());
+            }
+            TabPlacement::After(anchor) => {
+                entry.insert("after".into(), anchor.clone().into());
+            }
+            TabPlacement::Before(anchor) => {
+                entry.insert("before".into(), anchor.clone().into());
+            }
+        }
+        by_tab
+            .entry(addition.tab.as_str())
+            .or_default()
+            .push(serde_json::Value::Object(entry));
+    }
+    for (tab, entries) in by_tab {
+        let name = mod_id(&tab.replace(':', "_"));
+        let target = folder.join(format!("data/{namespace}/horizon/tab_entries/{name}.json"));
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let file = serde_json::json!({ "tab": tab, "entries": entries });
+        let text = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
         std::fs::write(&target, text).map_err(|e| e.to_string())?;
     }
     Ok(folder)

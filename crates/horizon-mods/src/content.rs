@@ -243,6 +243,53 @@ pub struct CreativeTab {
     pub items: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TabEntriesFile {
+    tab: String,
+    entries: Vec<TabEntryFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TabEntryFile {
+    item: String,
+    after: Option<String>,
+    before: Option<String>,
+    #[serde(default)]
+    start: bool,
+}
+
+/// Where a [`TabEntry`] goes in its tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TabPlacement {
+    /// After the tab's last item (the default).
+    End,
+    /// Before the tab's first item.
+    Start,
+    /// After the last occurrence of this item.
+    After(String),
+    /// Before the first occurrence of this item.
+    Before(String),
+}
+
+/// An item a mod puts in a tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabEntry {
+    pub item: String,
+    pub placement: TabPlacement,
+}
+
+/// Items a mod adds to an existing creative tab, vanilla's or another mod's
+/// (`data/<id>/horizon/tab_entries/`), in file order. Items the game doesn't
+/// have, and tabs it doesn't have, are left out when the game loads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabEntries {
+    /// The tab's id: `minecraft:<path>` or `<mod id>:<path>`.
+    pub tab: String,
+    pub entries: Vec<TabEntry>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Rarity {
@@ -366,6 +413,8 @@ pub struct Content {
     pub effects: Vec<MobEffect>,
     /// Its creative inventory tabs, by id.
     pub creative_tabs: Vec<CreativeTab>,
+    /// Items it adds to existing creative tabs, one per file, by file name.
+    pub tab_entries: Vec<TabEntries>,
     pub entity_types: Vec<EntityType>,
     pub menu_types: Vec<MenuType>,
     /// The namespaces it owns: the mod id, then the manifest's `namespaces`.
@@ -466,6 +515,7 @@ impl Content {
             items: Vec::new(),
             effects: Vec::new(),
             creative_tabs: Vec::new(),
+            tab_entries: Vec::new(),
             entity_types: Vec::new(),
             menu_types: Vec::new(),
             namespaces: manifest.owned_namespaces().map(str::to_owned).collect(),
@@ -484,6 +534,7 @@ impl Content {
             items: Vec::new(),
             effects: Vec::new(),
             creative_tabs: Vec::new(),
+            tab_entries: Vec::new(),
             entity_types: Vec::new(),
             menu_types: Vec::new(),
             namespaces: vec![namespace.to_owned()],
@@ -600,6 +651,7 @@ impl Content {
         let mut items = Vec::new();
         let mut effects = Vec::new();
         let mut tabs = Vec::new();
+        let mut tab_entries = Vec::new();
         let mut types = Vec::new();
         let mut menus = Vec::new();
         for name in &self.files {
@@ -645,13 +697,15 @@ impl Content {
                 effects.push((effect, name.clone()));
             } else if let Some(tab) = parse("creative_tab") {
                 tabs.push((tab, name.clone()));
+            } else if let Some(entries) = parse("tab_entries") {
+                tab_entries.push((entries, name.clone()));
             } else if let Some(kind) = parse("entity_type") {
                 types.push((kind, name.clone()));
             } else if let Some(menu) = parse("menu") {
                 menus.push((menu, name.clone()));
             } else {
                 return Err(format!(
-                    "{name}: data/{namespace}/horizon/ holds block/, item/, mob_effect/, creative_tab/, entity_type/ and menu/*.json only"
+                    "{name}: data/{namespace}/horizon/ holds block/, item/, mob_effect/, creative_tab/, tab_entries/, entity_type/ and menu/*.json only"
                 ));
             }
         }
@@ -751,6 +805,53 @@ impl Content {
                 title: file.title,
                 icon: file.icon,
                 items: file.items,
+            });
+        }
+        for (_, name) in tab_entries {
+            let file: TabEntriesFile =
+                serde_json::from_slice(&self.file(&name)?).map_err(|e| format!("{name}: {e}"))?;
+            let id_like = |s: &str| {
+                s.split_once(':')
+                    .is_some_and(|(n, p)| !n.is_empty() && !p.is_empty())
+            };
+            if !id_like(&file.tab) {
+                return Err(format!(
+                    "{name}: tab {:?} is a tab id (namespace:path)",
+                    file.tab
+                ));
+            }
+            let mut entries = Vec::new();
+            for e in file.entries {
+                let set = [e.after.is_some(), e.before.is_some(), e.start]
+                    .iter()
+                    .filter(|&&b| b)
+                    .count();
+                if set > 1 {
+                    return Err(format!(
+                        "{name}: {}: at most one of after, before and start",
+                        e.item
+                    ));
+                }
+                let anchor_ok = e.after.iter().chain(&e.before).all(|a| id_like(a));
+                if !id_like(&e.item) || !anchor_ok {
+                    return Err(format!(
+                        "{name}: item, after and before are item ids (namespace:path)"
+                    ));
+                }
+                let placement = match (e.after, e.before, e.start) {
+                    (Some(a), _, _) => TabPlacement::After(a),
+                    (_, Some(b), _) => TabPlacement::Before(b),
+                    (_, _, true) => TabPlacement::Start,
+                    _ => TabPlacement::End,
+                };
+                entries.push(TabEntry {
+                    item: e.item,
+                    placement,
+                });
+            }
+            self.tab_entries.push(TabEntries {
+                tab: file.tab,
+                entries,
             });
         }
         for (kind, name) in types {
@@ -1707,6 +1808,56 @@ capabilities = ["registries"]
         );
         let e = tab(r#"{"title": "Gems", "icon": "ruby", "items": []}"#).unwrap_err();
         assert!(e.contains("item ids"), "{e}");
+    }
+
+    /// Items added to existing tabs: placements, and the refusals.
+    #[test]
+    fn tab_entries_place_items_in_a_tab() {
+        let entries = |json: &str, path: &str| {
+            let files: &[(&str, &[u8])] = &[(path, json.as_bytes())];
+            hmod("entries", MANIFEST_TEXT, files)
+        };
+        let path = "data/ruby/horizon/tab_entries/tools.json";
+        let content = entries(
+            r#"{"tab": "minecraft:tools_and_utilities", "entries": [
+                {"item": "ruby:a"},
+                {"item": "ruby:b", "after": "minecraft:diamond_axe"},
+                {"item": "ruby:c", "before": "minecraft:stick"},
+                {"item": "ruby:d", "start": true}]}"#,
+            path,
+        )
+        .unwrap();
+        let entry = |item: &str, placement| TabEntry {
+            item: item.into(),
+            placement,
+        };
+        assert_eq!(
+            content.tab_entries,
+            [TabEntries {
+                tab: "minecraft:tools_and_utilities".into(),
+                entries: vec![
+                    entry("ruby:a", TabPlacement::End),
+                    entry(
+                        "ruby:b",
+                        TabPlacement::After("minecraft:diamond_axe".into())
+                    ),
+                    entry("ruby:c", TabPlacement::Before("minecraft:stick".into())),
+                    entry("ruby:d", TabPlacement::Start),
+                ],
+            }]
+        );
+        let e = entries(
+            r#"{"tab": "minecraft:food_and_drinks", "entries": [{"item": "ruby:a", "after": "minecraft:apple", "before": "minecraft:bread"}]}"#,
+            path,
+        )
+        .unwrap_err();
+        assert!(e.contains("at most one"), "{e}");
+        let e = entries(
+            r#"{"tab": "minecraft:food_and_drinks", "entries": []}"#,
+            "data/other/horizon/tab_entries/food.json",
+        )
+        .unwrap_err();
+        assert!(e.contains("namespace"), "{e}");
     }
 
     #[test]

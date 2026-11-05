@@ -74,7 +74,7 @@ A content mod has capability `registries` and carries `assets/` and `data/` in t
 by declaring them in `data/<ns>/horizon/block/*.json` and `data/<ns>/horizon/item/*.json` (`<ns>` is the mod id or a
 namespace it lists, so a mod id `a_b` can own `a-b`, whose ids vanilla allows but mod ids do not), each copying a vanilla
 template ([modpacks.md](modpacks.md#registries-02-data-driven-blocks-items-and-mob-effects)), and creative tabs, mob
-effects, entity types and menu types (each below) in `creative_tab/`, `mob_effect/`, `entity_type/` and `menu/` beside
+effects, entity types and menu types (each below) in `creative_tab/` (and `tab_entries/` for existing tabs), `mob_effect/`, `entity_type/` and `menu/` beside
 them. LAN and dedicated server players play with them when they run the same mods: a client whose mods add different
 content is refused when it joins, with the reason.
 
@@ -229,6 +229,28 @@ text: `"title": "itemGroup.ruby"` uses that key from the mod's lang files, and a
 lang file's `itemGroup.<mod id>.<file name>` (`creative_tab/gems.json` →
 `itemGroup.ruby.gems`) translates any title. A mod's items join the search tab
 under their names.
+
+A mod puts items into tabs that already exist, vanilla's or another mod's, with
+`data/<ns>/horizon/tab_entries/<name>.json` (`<ns>` any namespace the mod owns), as
+Fabric's `CreativeModeTabEvents.modifyOutputEvent` and NeoForge's `BuildCreativeModeTabContentsEvent` do:
+
+```json
+{
+  "tab": "minecraft:tools_and_utilities",
+  "entries": [
+    { "item": "ruby:ruby_pickaxe" },
+    { "item": "ruby:ruby_axe", "after": "minecraft:diamond_axe" },
+    { "item": "ruby:ruby_shovel", "before": "minecraft:iron_pickaxe" },
+    { "item": "ruby:ruby_compass", "start": true }
+  ]
+}
+```
+
+`tab` is a tab id (`minecraft:...` for vanilla's, `<mod id>:<file name>` for a mod's). An entry with none of `after`,
+`before` and `start` goes at the end of the tab; setting more than one of them is refused. `after` puts the item behind
+the anchor's last occurrence, `before` in front of its first; several entries after the same anchor keep their file
+order. An anchor the tab doesn't hold appends the item at the end, and a tab the game doesn't have is skipped,
+each with a warning in the log; an item the game doesn't have is left out, as in a mod's own tab. Files apply in mod order, then file order, after the mods' own tabs exist.
 
 A component type no vanilla item has is refused, so a misspelt one fails
 the load instead of doing nothing. Behaviour the game ties to a vanilla

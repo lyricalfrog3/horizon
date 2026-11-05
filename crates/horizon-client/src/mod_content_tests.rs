@@ -93,6 +93,7 @@ fn creative_tabs_keep_vanilla_items_missing_from_search() {
         defaults: BTreeMap::new(),
         sounds: BTreeMap::new(),
         tabs: vec![&tab],
+        tab_entries: Vec::new(),
         names: BTreeMap::new(),
     };
     let mut doc: J = serde_json::from_str(
@@ -109,6 +110,98 @@ fn creative_tabs_keep_vanilla_items_missing_from_search() {
             "{count:1,id:\"minecraft:written_book\"}",
             "{count:1,id:\"minecraft:knowledge_book\"}",
         ])
+    );
+}
+
+/// A mod's `tab_entries` go into an existing tab's row: at its end, after or
+/// before an anchor, at its start; a missing anchor appends and an item the
+/// game doesn't have is skipped. No game files.
+#[test]
+fn tab_entries_go_into_existing_tabs() {
+    use horizon_mods::content::{TabEntries, TabEntry, TabPlacement};
+    let entry = |item: &str, placement| TabEntry {
+        item: item.into(),
+        placement,
+    };
+    let after = |a: &str| TabPlacement::After(a.into());
+    let files = [
+        TabEntries {
+            tab: "minecraft:tools".into(),
+            entries: vec![
+                entry("test:end", TabPlacement::End),
+                entry("test:a", after("minecraft:axe")),
+                entry("test:b", after("minecraft:axe")),
+                entry("test:before", TabPlacement::Before("minecraft:axe".into())),
+                entry("test:first", TabPlacement::Start),
+                entry("test:lost", after("minecraft:nothing")),
+                entry("test:unknown", TabPlacement::End),
+            ],
+        },
+        TabEntries {
+            tab: "minecraft:no_such_tab".into(),
+            entries: vec![entry("test:end", TabPlacement::End)],
+        },
+    ];
+    let plan = Plan {
+        blocks: Vec::new(),
+        items: [
+            "test:end",
+            "test:a",
+            "test:b",
+            "test:before",
+            "test:first",
+            "test:lost",
+        ]
+        .map(|to| NewItem {
+            rename: Rename::new("minecraft:stick", to),
+            max_stack_size: None,
+            rarity: None,
+            components: Vec::new(),
+            crafting_remainder: None,
+            wall_block: None,
+        })
+        .into(),
+        vanilla_items: BTreeSet::new(),
+        effects: Vec::new(),
+        entity_types: Vec::new(),
+        menu_types: Vec::new(),
+        states: 0,
+        defaults: BTreeMap::new(),
+        sounds: BTreeMap::new(),
+        tabs: Vec::new(),
+        tab_entries: files.iter().collect(),
+        names: BTreeMap::new(),
+    };
+    let mut doc: J = serde_json::from_str(
+        r#"{"tabs":[{"id":"minecraft:tools","type":"CATEGORY","items":["{count:1,id:\"minecraft:pick\"}","{count:1,id:\"minecraft:axe\"}","{count:1,id:\"minecraft:hoe\"}"]}]}"#,
+    )
+    .unwrap();
+    plan.creative_tabs(&mut doc).unwrap();
+    let doc: serde_json::Value = serde_json::to_value(doc).unwrap();
+    let items: Vec<String> = doc["tabs"][0]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            s.as_str()
+                .unwrap()
+                .replace("{count:1,id:\"", "")
+                .replace("\"}", "")
+        })
+        .collect();
+    assert_eq!(
+        items,
+        [
+            "test:first",
+            "minecraft:pick",
+            "test:before",
+            "minecraft:axe",
+            "test:a",
+            "test:b",
+            "minecraft:hoe",
+            "test:end",
+            "test:lost",
+        ]
     );
 }
 
