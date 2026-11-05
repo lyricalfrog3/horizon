@@ -216,6 +216,7 @@ pub fn draw(
         glint_speed,
         glint_alpha,
         None,
+        Mat4::IDENTITY,
     );
     if let Some(key) = key
         && let Ok(mut drawn) = renderer.gui_drawn.lock()
@@ -257,6 +258,44 @@ pub fn draw_scissored(
         0.0,
         0.0,
         Some(scissor),
+        Mat4::IDENTITY,
+    );
+}
+
+/// [`draw`] with the model turned `rotation_y` degrees about its vertical
+/// axis before the item's own display transform, as a pose stack rotated
+/// ahead of `ItemStackRenderState.submit` (a tooltip's spinning model). Not
+/// cached: a turning model changes every frame.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_rotated(
+    state: &ItemRenderState,
+    renderer: &ItemRenderer,
+    sprites: &HashMap<String, Rect>,
+    host: &dyn SpecialHost,
+    batch: &mut HudBatch,
+    x: f32,
+    y: f32,
+    rotation_y: f32,
+    time: f32,
+    glint_speed: f32,
+    glint_alpha: f32,
+) {
+    if state.is_empty() {
+        return;
+    }
+    draw_now(
+        state,
+        renderer,
+        sprites,
+        host,
+        batch,
+        x,
+        y,
+        time,
+        glint_speed,
+        glint_alpha,
+        None,
+        Mat4::from_rotation_y(rotation_y.to_radians()),
     );
 }
 
@@ -325,9 +364,11 @@ fn draw_now(
     glint_speed: f32,
     glint_alpha: f32,
     scissor: Option<[f32; 4]>,
+    model: Mat4,
 ) {
     let pose = Mat4::from_translation(Vec3::new(x + 8.0, y + 8.0, 0.0))
-        * Mat4::from_scale(Vec3::new(16.0, -16.0, 16.0));
+        * Mat4::from_scale(Vec3::new(16.0, -16.0, 16.0))
+        * model;
     let mut quads: Vec<ItemQuad> = Vec::new();
     state.submit(renderer, sprites, host, pose, &mut quads);
     let lights = if state.uses_block_light() {

@@ -108,15 +108,18 @@ pub(in super::super) fn replay_fabric_draws(
                 size,
                 rotation,
             } => {
-                let _ = rotation;
                 if let Some(game) = game {
                     // Draw the item through the game's GUI item renderer at
-                    // its 16 px size, then scale what it drew to the requested
-                    // square. The HUD has no 3D model transform, so the Y
-                    // rotation is not applied.
+                    // its 16 px size, turned about its vertical axis, then
+                    // scale what it drew to the requested square.
                     let (x, y) = (x as f32, y as f32);
                     let start = batch.vertices.len();
-                    game.draw_item_model(batch, &ItemStack::new(&item, 1), x, y);
+                    let stack = ItemStack::new(&item, 1);
+                    if rotation == 0.0 {
+                        game.draw_item_model(batch, &stack, x, y);
+                    } else {
+                        game.draw_item_model_rotated(batch, &stack, x, y, rotation);
+                    }
                     let scale = size.max(1) as f32 / 16.0;
                     if scale != 1.0 {
                         for vertex in &mut batch.vertices[start..] {

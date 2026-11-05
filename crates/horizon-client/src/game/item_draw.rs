@@ -382,6 +382,32 @@ impl Game<'_> {
             self.glint_frame.alpha,
         );
     }
+    /// [`Self::draw_item_model`] turned `rotation_y` degrees about the model's
+    /// vertical axis (a Fabric tooltip's spinning item model).
+    pub(super) fn draw_item_model_rotated(
+        &self,
+        batch: &mut HudBatch,
+        stack: &ItemStack,
+        x: f32,
+        y: f32,
+        rotation_y: f32,
+    ) {
+        let owner = self.player_owner(Some(stack));
+        let state = self.resolve_item(stack, DisplayContext::Gui, Some(&owner), 0);
+        item_render::gui::draw_rotated(
+            &state,
+            &self.pack.item_renderer,
+            &self.gui.atlas.sprites,
+            &self.item_host(),
+            batch,
+            x,
+            y,
+            rotation_y,
+            self.glint_frame.millis / 1000.0,
+            self.glint_frame.speed,
+            self.glint_frame.alpha,
+        );
+    }
     /// The glint clock, options and sprite for this frame: read once per
     /// frame, not per item (`GameRenderer.extractOptions`).
     pub(super) fn capture_glint_frame(&self) -> item_render::GlintFrame {
