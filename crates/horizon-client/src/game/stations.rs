@@ -25,7 +25,7 @@ fn tooltip_position(
     (x, y)
 }
 
-use super::fabric_bridge::replay_fabric_draws;
+use super::fabric_bridge::{replay_fabric_draws, translate_draw};
 use super::{Game, Screen};
 use horizon_client::{
     block_entity_item, brewing,
@@ -2696,6 +2696,11 @@ impl Game<'_> {
         }
         lines.splice(1..1, after_name);
         let lines = Self::resolved(&lines);
+        // A mod that builds the tooltip from Minecraft's component list draws
+        // its own text (and its centred title, model and frame). Otherwise the
+        // host keeps its own text renderer.
+        let mod_tooltip =
+            self.fabric_tooltip_render(stack, &lines, batch.width as i32, batch.height as i32);
         // The component's height does not depend on where it is drawn, so a
         // probe at the origin gives the box its extra height.
         let probe = horizon_client::bundle::tooltip_layout(self.items(), stack, 0.0, 0.0, 96.0);
@@ -2705,18 +2710,36 @@ impl Game<'_> {
         let component = tooltip_component_size(component);
         let extra = bundle_extra + component.map_or(0.0, |size| size[1] + 2.0);
         let min_width = (if probe.is_some() { 96.0_f32 } else { 0.0 })
-            .max(component.map_or(0.0, |size| size[0]));
+            .max(component.map_or(0.0, |size| size[0]))
+            .max(mod_tooltip.as_ref().map_or(0.0, |t| t.width as f32));
         let atlas = &self.gui.atlas;
-        let (x, y, w, h) = Self::tooltip_geometry(
+        let (cursor_x, cursor_y) = (x, y);
+        let (mut x, mut y, mut w, mut h) = Self::tooltip_geometry(
             atlas,
             &lines,
             (x, y),
             (batch.width, batch.height),
             [min_width, extra],
         );
+        if let Some(tooltip) = &mod_tooltip {
+            w = w.max(tooltip.width as f32);
+            h = h.max(tooltip.height as f32);
+            let (px, py) =
+                tooltip_position((cursor_x, cursor_y), (batch.width, batch.height), (w, h));
+            x = px;
+            y = py;
+        }
         self.tooltip_box(batch, Some(stack), x, y, w, h);
         let text_h = h - extra;
-        Self::tooltip_text(batch, atlas, &lines, x, y);
+        if let Some(tooltip) = &mod_tooltip {
+            let mut draws = tooltip.draws.clone();
+            for draw in &mut draws {
+                translate_draw(draw, x as i32, y as i32);
+            }
+            replay_fabric_draws(batch, &self.gui.atlas, draws, Some(self));
+        } else {
+            Self::tooltip_text(batch, atlas, &lines, x, y);
+        }
         if let Some(layout) =
             horizon_client::bundle::tooltip_layout(self.items(), stack, x, y + text_h + 2.0, w)
         {
@@ -2731,19 +2754,22 @@ impl Game<'_> {
                 size,
             );
         }
-        // Iceberg's `RenderTooltipEvents.POSTEXT` runs at the tail of vanilla's
-        // tooltip pass, after the text. A mod that draws its own frame records
-        // the border, shadow and separator here.
-        let draws = self.fabric_tooltip_frame(
-            stack,
-            x as i32,
-            y as i32,
-            w as i32,
-            h as i32,
-            batch.width as i32,
-            batch.height as i32,
-        );
-        replay_fabric_draws(batch, &self.gui.atlas, draws);
+        if mod_tooltip.is_none() {
+            // Iceberg's `RenderTooltipEvents.POSTEXT` runs at the tail of
+            // vanilla's tooltip pass, after the text. A mod that draws its own
+            // frame records the border, shadow and separator here.
+            let draws = self.fabric_tooltip_frame(
+                stack,
+                &lines,
+                x as i32,
+                y as i32,
+                w as i32,
+                h as i32,
+                batch.width as i32,
+                batch.height as i32,
+            );
+            replay_fabric_draws(batch, &self.gui.atlas, draws, Some(self));
+        }
     }
     /// `ClientBundleTooltip.extractSelectedItemTooltip`: the selected item's
     /// name in a box of its own, centred over the grid (less 12) and 15 above

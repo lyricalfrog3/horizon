@@ -1218,7 +1218,7 @@ impl Loading {
                 fabric_bridge::apply_fabric_host_requests(&mut self.menu.clipboard);
                 let draws =
                     fabric_bridge::fabric_screen_draws(batch.width as i32, batch.height as i32);
-                fabric_bridge::replay_fabric_draws(batch, &gui.atlas, draws);
+                fabric_bridge::replay_fabric_draws(batch, &gui.atlas, draws, None);
                 return;
             }
         }

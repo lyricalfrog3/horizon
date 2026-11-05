@@ -8117,7 +8117,7 @@ impl Game<'_> {
                     fabric_bridge::apply_fabric_host_requests(&mut self.clipboard);
                     let draws =
                         fabric_bridge::fabric_screen_draws(batch.width as i32, batch.height as i32);
-                    fabric_bridge::replay_fabric_draws(&mut batch, &self.gui.atlas, draws);
+                    fabric_bridge::replay_fabric_draws(&mut batch, &self.gui.atlas, draws, Some(self));
                     self.draw_toasts(&mut batch, false);
                     self.draw_tutorial_toasts(&mut batch, false);
                     self.draw_pack_toasts(&mut batch, false);

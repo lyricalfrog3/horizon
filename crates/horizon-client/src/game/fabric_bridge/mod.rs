@@ -19,7 +19,7 @@ mod textures;
 pub(super) use gui::{
     apply_fabric_host_requests, fabric_screen_char, fabric_screen_close_current,
     fabric_screen_draws, fabric_screen_key, fabric_screen_mouse, fabric_screen_mouse_moved,
-    fabric_screen_open, fabric_screen_scroll, replay_fabric_draws,
+    fabric_screen_open, fabric_screen_scroll, replay_fabric_draws, translate_draw,
 };
 pub(super) use menu::{draw_menu_widgets, menu_widget_press};
 
@@ -400,11 +400,45 @@ impl Game<'_> {
         horizon_client::item_tooltip::rarity(stack, default)
     }
 
+    /// The mods' full tooltip: their real `ClientTooltipComponent` list
+    /// (gathered, with a centred title) plus the `POSTEXT` frame, as draws
+    /// relative to the tooltip's text origin. `None` when no Iceberg tooltip
+    /// event has a listener.
+    pub(super) fn fabric_tooltip_render(
+        &self,
+        stack: &ItemStack,
+        lines: &[(Text, u32)],
+        screen_width: i32,
+        screen_height: i32,
+    ) -> Option<hfc_runtime::bridge::TooltipRender> {
+        let Ok(mut bridge) = get_fabric_bridge().lock() else {
+            return None;
+        };
+        let rarity = self.stack_rarity(stack);
+        let max_damage = self
+            .items()
+            .get(&stack.item)
+            .map_or(0, |info| info.max_damage as i32);
+        let raw_lines: Vec<(String, u32)> = lines
+            .iter()
+            .map(|(text, color)| (text.plain(), *color))
+            .collect();
+        bridge.item_tooltip_render(
+            &stack.item,
+            Some(rarity),
+            max_damage,
+            &raw_lines,
+            screen_width,
+            screen_height,
+        )
+    }
+
     /// `RenderTooltipEvents.POSTEXT`: let Iceberg-family mods draw a tooltip
     /// frame into a display list the host replays after the tooltip text.
     pub(super) fn fabric_tooltip_frame(
         &self,
         stack: &ItemStack,
+        lines: &[(Text, u32)],
         x: i32,
         y: i32,
         width: i32,
@@ -416,9 +450,19 @@ impl Game<'_> {
             return Vec::new();
         };
         let rarity = self.stack_rarity(stack);
+        let max_damage = self
+            .items()
+            .get(&stack.item)
+            .map_or(0, |info| info.max_damage as i32);
+        let raw_lines: Vec<(String, u32)> = lines
+            .iter()
+            .map(|(text, color)| (text.plain(), *color))
+            .collect();
         bridge.item_tooltip_frame(
             &stack.item,
             Some(rarity),
+            max_damage,
+            &raw_lines,
             screen_width,
             screen_height,
             x,

@@ -3,6 +3,7 @@
 
 use super::super::{Game, Screen};
 use horizon_client::hud::{HudBatch, rgba};
+use horizon_client::items::ItemStack;
 use winit::keyboard::KeyCode;
 
 use super::get_fabric_bridge;
@@ -16,7 +17,7 @@ pub(super) fn abgr(color: u32) -> u32 {
     rgba(r, g, b, a)
 }
 
-pub(super) fn translate_draw(draw: &mut GuiDraw, dx: i32, dy: i32) {
+pub(in super::super) fn translate_draw(draw: &mut GuiDraw, dx: i32, dy: i32) {
     match draw {
         GuiDraw::Fill { x1, y1, x2, y2, .. } => {
             *x1 += dx;
@@ -31,6 +32,10 @@ pub(super) fn translate_draw(draw: &mut GuiDraw, dx: i32, dy: i32) {
             *y2 += dy;
         }
         GuiDraw::Text { x, y, .. } => {
+            *x += dx;
+            *y += dy;
+        }
+        GuiDraw::Item { x, y, .. } => {
             *x += dx;
             *y += dy;
         }
@@ -54,6 +59,7 @@ pub(in super::super) fn replay_fabric_draws(
     batch: &mut HudBatch,
     atlas: &horizon_client::hud::HudAtlas,
     draws: Vec<hfc_runtime::minecraft::GuiDraw>,
+    game: Option<&Game<'_>>,
 ) {
     // Every caller replays through here, so the images the blits name (a mod's
     // icons and sprites) are in the atlas whichever screen opened them.
@@ -92,6 +98,27 @@ pub(in super::super) fn replay_fabric_draws(
             hfc_runtime::minecraft::GuiDraw::Text { text, x, y, color } => {
                 if !text.is_empty() && text != "null" && !text.starts_with("[Object ") {
                     batch.text(atlas, &text, x as f32, y as f32, abgr(color as u32), true);
+                }
+            }
+            hfc_runtime::minecraft::GuiDraw::Item {
+                item,
+                x,
+                y,
+                size,
+                rotation,
+            } => {
+                let _ = rotation;
+                if let Some(game) = game {
+                    // The HUD replay has no 3D model transform: draw the item
+                    // through the game's GUI item renderer, centred in the
+                    // requested square.
+                    let offset = ((size - 16).max(0) / 2) as f32;
+                    game.draw_item_model(
+                        batch,
+                        &ItemStack::new(&item, 1),
+                        x as f32 + offset,
+                        y as f32 + offset,
+                    );
                 }
             }
             hfc_runtime::minecraft::GuiDraw::Blit {
@@ -446,6 +473,6 @@ impl Game<'_> {
                 .unwrap_or_default(),
             Err(_) => return,
         };
-        replay_fabric_draws(batch, &self.gui.atlas, draws);
+        replay_fabric_draws(batch, &self.gui.atlas, draws, Some(self));
     }
 }

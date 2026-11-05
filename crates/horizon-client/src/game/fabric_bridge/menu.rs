@@ -133,7 +133,7 @@ pub(super) fn draw_menu_widgets_onto(
         for draw in &mut draws {
             translate_draw(draw, offset_x, offset_y);
         }
-        replay_fabric_draws(batch, atlas, draws);
+        replay_fabric_draws(batch, atlas, draws, None);
     }
 }
 
