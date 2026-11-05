@@ -918,6 +918,7 @@ impl Loading {
                                 key,
                                 key_event.state == ElementState::Pressed,
                             );
+                            fabric_bridge::apply_fabric_host_requests(&mut self.menu.clipboard);
                         }
                     }
                     if key_event.state == ElementState::Pressed
@@ -945,6 +946,7 @@ impl Loading {
                         self.menu.cursor.1,
                         *state == ElementState::Pressed,
                     );
+                    fabric_bridge::apply_fabric_host_requests(&mut self.menu.clipboard);
                     if !fabric_bridge::fabric_screen_open() {
                         self.startup_fabric = false;
                     }
@@ -1213,6 +1215,7 @@ impl Loading {
             if !fabric_bridge::fabric_screen_open() {
                 self.startup_fabric = false;
             } else {
+                fabric_bridge::apply_fabric_host_requests(&mut self.menu.clipboard);
                 let draws =
                     fabric_bridge::fabric_screen_draws(batch.width as i32, batch.height as i32);
                 fabric_bridge::replay_fabric_draws(batch, &gui.atlas, draws);

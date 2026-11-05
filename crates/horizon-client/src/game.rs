@@ -8114,6 +8114,7 @@ impl Game<'_> {
                 if !fabric_bridge::fabric_screen_open() {
                     self.title_fabric = false;
                 } else {
+                    fabric_bridge::apply_fabric_host_requests(&mut self.clipboard);
                     let draws =
                         fabric_bridge::fabric_screen_draws(batch.width as i32, batch.height as i32);
                     fabric_bridge::replay_fabric_draws(&mut batch, &self.gui.atlas, draws);

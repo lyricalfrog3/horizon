@@ -259,6 +259,27 @@ pub(in super::super) fn fabric_screen_scroll(x: f32, y: f32, dx: f32, dy: f32) {
     }
 }
 
+/// Perform the desktop actions mods asked for: open a link in the browser, a
+/// folder in the file manager, or put text on the system clipboard.
+pub(in super::super) fn apply_fabric_host_requests(
+    clipboard: &mut impl horizon_client::clipboard::Clipboard,
+) {
+    let requests = match get_fabric_bridge().lock() {
+        Ok(mut bridge) => bridge.take_host_requests(),
+        Err(_) => return,
+    };
+    for request in requests {
+        eprintln!("Horizon: Fabric request {request:?}");
+        match request {
+            hfc_runtime::bridge::HostRequest::OpenUri(uri) => super::super::packs::open_uri(&uri),
+            hfc_runtime::bridge::HostRequest::OpenPath(path) => {
+                super::super::packs::open_folder(std::path::Path::new(&path))
+            }
+            hfc_runtime::bridge::HostRequest::SetClipboard(text) => clipboard.set(&text),
+        }
+    }
+}
+
 impl Game<'_> {
     /// Run Fabric's client tick and follow the screen a mod installed. A screen
     /// opening over gameplay takes the same input as the host's own screens.
@@ -273,6 +294,7 @@ impl Game<'_> {
     /// click on a widget a mod added to a host menu opens it immediately, even
     /// when the paused game is not ticking.
     pub(in super::super) fn fabric_follow_screen(&mut self) {
+        apply_fabric_host_requests(&mut self.clipboard);
         let (open, screen) = if let Ok(bridge) = get_fabric_bridge().lock() {
             (bridge.has_screen(), bridge.current_screen())
         } else {
@@ -373,6 +395,8 @@ impl Game<'_> {
     /// Widget sprites come from the HUD atlas, GUI backgrounds get a dark
     /// fallback until they are packed, and scissors clip the recorded quads.
     pub(in super::super) fn draw_fabric_screen(&mut self, batch: &mut HudBatch) {
+        // Every frame, so a click's request runs while the game is paused.
+        apply_fabric_host_requests(&mut self.clipboard);
         let draws = match get_fabric_bridge().lock() {
             Ok(mut bridge) => bridge
                 .render_screen(batch.width as i32, batch.height as i32, 0.0)

@@ -1249,6 +1249,7 @@ dependencies = [
  "flate2",
  "hfc-core",
  "log",
+ "regex",
  "serde",
  "serde_json",
  "zip",

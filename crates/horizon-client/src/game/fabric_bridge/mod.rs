@@ -17,9 +17,9 @@ mod menu;
 mod textures;
 
 pub(super) use gui::{
-    fabric_screen_char, fabric_screen_close_current, fabric_screen_draws, fabric_screen_key,
-    fabric_screen_mouse, fabric_screen_mouse_moved, fabric_screen_open, fabric_screen_scroll,
-    replay_fabric_draws,
+    apply_fabric_host_requests, fabric_screen_char, fabric_screen_close_current,
+    fabric_screen_draws, fabric_screen_key, fabric_screen_mouse, fabric_screen_mouse_moved,
+    fabric_screen_open, fabric_screen_scroll, replay_fabric_draws,
 };
 pub(super) use menu::{draw_menu_widgets, menu_widget_press};
 
