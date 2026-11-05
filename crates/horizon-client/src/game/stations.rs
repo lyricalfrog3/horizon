@@ -25,6 +25,7 @@ fn tooltip_position(
     (x, y)
 }
 
+use super::fabric_bridge::replay_fabric_draws;
 use super::{Game, Screen};
 use horizon_client::{
     block_entity_item, brewing,
@@ -2616,6 +2617,14 @@ impl Game<'_> {
         let (mut background, mut border_top, mut border_bottom) =
             (0xf0100010, 0x505000ff, 0x5028007f);
         self.native_tooltip_color(stack, &mut background, &mut border_top, &mut border_bottom);
+        // Iceberg's background mixin is not applied in this runtime, so the
+        // host's own box stays under any custom frame. Legendary Tooltips asks
+        // for a transparent gradient background on its custom frames (the
+        // frame texture supplies the border); keep the host background rather
+        // than leaving the text over the world.
+        if background.to_be_bytes()[0] == 0 {
+            background = 0xf0100010;
+        }
         let convert = |color: u32| {
             let [a, r, g, b] = color.to_be_bytes();
             rgba(r, g, b, a)
@@ -2722,6 +2731,19 @@ impl Game<'_> {
                 size,
             );
         }
+        // Iceberg's `RenderTooltipEvents.POSTEXT` runs at the tail of vanilla's
+        // tooltip pass, after the text. A mod that draws its own frame records
+        // the border, shadow and separator here.
+        let draws = self.fabric_tooltip_frame(
+            stack,
+            x as i32,
+            y as i32,
+            w as i32,
+            h as i32,
+            batch.width as i32,
+            batch.height as i32,
+        );
+        replay_fabric_draws(batch, &self.gui.atlas, draws);
     }
     /// `ClientBundleTooltip.extractSelectedItemTooltip`: the selected item's
     /// name in a box of its own, centred over the grid (less 12) and 15 above

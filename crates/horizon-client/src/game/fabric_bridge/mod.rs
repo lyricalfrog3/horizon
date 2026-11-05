@@ -384,7 +384,47 @@ impl Game<'_> {
         let Ok(mut bridge) = get_fabric_bridge().lock() else {
             return;
         };
+        let rarity = stack.map(|stack| self.stack_rarity(stack));
         let item_id = stack.map(|s| &*s.item);
-        bridge.item_tooltip_color(item_id, background, border_top, border_bottom);
+        bridge.item_tooltip_color(item_id, rarity, background, border_top, border_bottom);
+    }
+
+    /// The item's rarity as the host's item data reports it, the value
+    /// `ItemStack.getRarity()` answers to mods.
+    fn stack_rarity(&self, stack: &ItemStack) -> &str {
+        let default = self
+            .stations()
+            .enchantments
+            .props(&stack.item)
+            .map_or("common", |props| props.rarity.as_str());
+        horizon_client::item_tooltip::rarity(stack, default)
+    }
+
+    /// `RenderTooltipEvents.POSTEXT`: let Iceberg-family mods draw a tooltip
+    /// frame into a display list the host replays after the tooltip text.
+    pub(super) fn fabric_tooltip_frame(
+        &self,
+        stack: &ItemStack,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        screen_width: i32,
+        screen_height: i32,
+    ) -> Vec<hfc_runtime::minecraft::GuiDraw> {
+        let Ok(mut bridge) = get_fabric_bridge().lock() else {
+            return Vec::new();
+        };
+        let rarity = self.stack_rarity(stack);
+        bridge.item_tooltip_frame(
+            &stack.item,
+            Some(rarity),
+            screen_width,
+            screen_height,
+            x,
+            y,
+            width,
+            height,
+        )
     }
 }

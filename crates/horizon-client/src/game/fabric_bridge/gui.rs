@@ -24,6 +24,12 @@ pub(super) fn translate_draw(draw: &mut GuiDraw, dx: i32, dy: i32) {
             *x2 += dx;
             *y2 += dy;
         }
+        GuiDraw::Gradient { x1, y1, x2, y2, .. } => {
+            *x1 += dx;
+            *y1 += dy;
+            *x2 += dx;
+            *y2 += dy;
+        }
         GuiDraw::Text { x, y, .. } => {
             *x += dx;
             *y += dy;
@@ -66,6 +72,23 @@ pub(in super::super) fn replay_fabric_draws(
                 let (y, h) = (y1.min(y2) as f32, (y2 - y1).abs() as f32);
                 batch.fill(atlas, x, y, w, h, abgr(color as u32));
             }
+            hfc_runtime::minecraft::GuiDraw::Gradient {
+                x1,
+                y1,
+                x2,
+                y2,
+                color_from,
+                color_to,
+            } => {
+                let (x, w) = (x1.min(x2) as f32, (x2 - x1).abs() as f32);
+                let (y, h) = (y1.min(y2) as f32, (y2 - y1).abs() as f32);
+                batch.fill_gradient(
+                    atlas,
+                    (x, y, w, h),
+                    abgr(color_from as u32),
+                    abgr(color_to as u32),
+                );
+            }
             hfc_runtime::minecraft::GuiDraw::Text { text, x, y, color } => {
                 if !text.is_empty() && text != "null" && !text.starts_with("[Object ") {
                     batch.text(atlas, &text, x as f32, y as f32, abgr(color as u32), true);
@@ -77,6 +100,10 @@ pub(in super::super) fn replay_fabric_draws(
                 y,
                 width,
                 height,
+                u0,
+                u1,
+                v0,
+                v1,
             } => {
                 let name = texture.strip_prefix("minecraft:").unwrap_or(&texture);
                 // A widget identifier is `minecraft:widget/button`; the
@@ -106,12 +133,26 @@ pub(in super::super) fn replay_fabric_draws(
                         u32::MAX,
                     );
                 } else if let Ok(rects) = fabric_texture_rects().lock()
-                    && let Some(rect) = rects.get(&texture).copied()
+                    && let Some(mut rect) = rects.get(&texture).copied()
                 {
                     // A mod's registered texture (its own icon, an image it
                     // read with `NativeImage.read` and registered through
                     // `TextureManager`): decoded and placed in the atlas's
-                    // run-time region on the frame it first appeared.
+                    // run-time region on the frame it first appeared. The blit
+                    // may name only part of it, which is how a nine-slice frame
+                    // draws its corners and edges from one sheet.
+                    let u0 = u0.clamp(0.0, 1.0);
+                    let u1 = u1.clamp(0.0, 1.0);
+                    let v0 = v0.clamp(0.0, 1.0);
+                    let v1 = v1.clamp(0.0, 1.0);
+                    if (u0, u1, v0, v1) != (0.0, 1.0, 0.0, 1.0) {
+                        let (left, top) = (rect.u0, rect.v0);
+                        let (span_u, span_v) = (rect.u1 - rect.u0, rect.v1 - rect.v0);
+                        rect.u0 = left + span_u * u0;
+                        rect.u1 = left + span_u * u1;
+                        rect.v0 = top + span_v * v0;
+                        rect.v1 = top + span_v * v1;
+                    }
                     batch.rect_uv(
                         x as f32,
                         y as f32,
