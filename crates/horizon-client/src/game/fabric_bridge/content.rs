@@ -14,7 +14,7 @@
 //! `tab_entries` file per tab.
 
 use hfc_runtime::bridge::{CreativeTabAddition, FabricModMetadata, RegisteredItem, TabPlacement};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -88,7 +88,7 @@ fn mod_id(namespace: &str) -> String {
 /// assets and data, and its additions to vanilla and convention tags (what a
 /// content mod may carry). Declarations are written from the runtime, not
 /// copied.
-fn carried(name: &str, namespace: &str) -> bool {
+fn carried(name: &str, namespace: &str, referenced: &BTreeSet<String>) -> bool {
     let mut parts = name.splitn(3, '/');
     let (top, ns, rest) = (
         parts.next().unwrap_or(""),
@@ -99,11 +99,68 @@ fn carried(name: &str, namespace: &str) -> bool {
         return false;
     }
     match top {
-        "assets" => ns == namespace,
+        // The mod's own assets, and the worn-armour files its items name in
+        // another namespace (vanilla's data-driven equipment lives under
+        // `minecraft`).
+        "assets" => ns == namespace || referenced.contains(name),
         "data" if ns == namespace => !rest.starts_with("horizon/"),
         "data" => matches!(ns, "minecraft" | "c") && rest.starts_with("tags/"),
         _ => false,
     }
+}
+
+/// The equipment assets the items' `minecraft:equippable` `asset_id`s name, and the
+/// textures those assets' layers name, as jar paths outside `namespace` that a content
+/// mod may carry: only `minecraft` (Horizon's fence lets a mod add equipment there
+/// without replacing vanilla's). `read` gives a jar file's bytes. Files in the mod's own
+/// namespace are carried anyway.
+fn referenced_equipment(
+    items: &[RegisteredItem],
+    namespace: &str,
+    mut read: impl FnMut(&str) -> Option<Vec<u8>>,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let assets: BTreeSet<&str> = items
+        .iter()
+        .filter_map(|i| {
+            i.components
+                .get("minecraft:equippable")?
+                .get("asset_id")?
+                .as_str()
+        })
+        .collect();
+    for asset in assets {
+        let (ns, path) = asset.split_once(':').unwrap_or(("minecraft", asset));
+        if !matches!(ns, "minecraft") && ns != namespace {
+            continue;
+        }
+        let file = format!("assets/{ns}/equipment/{path}.json");
+        let Some(doc) =
+            read(&file).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        else {
+            continue;
+        };
+        out.insert(file);
+        let Some(layers) = doc.get("layers").and_then(|l| l.as_object()) else {
+            continue;
+        };
+        for (kind, list) in layers {
+            for layer in list.as_array().into_iter().flatten() {
+                // A layer without a texture uses the asset's own id.
+                let texture = layer
+                    .get("texture")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or(asset);
+                let (tns, tpath) = texture.split_once(':').unwrap_or(("minecraft", texture));
+                if tns == "minecraft" || tns == namespace {
+                    out.insert(format!(
+                        "assets/{tns}/textures/entity/equipment/{kind}/{tpath}.png"
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The loaded mod whose jar holds `namespace`: the mod of that id, else one
@@ -161,11 +218,16 @@ fn write_mod(
     let jar = owner.jar.as_deref().ok_or("the mod has no jar")?;
     let file = std::fs::File::open(jar).map_err(|e| format!("{jar}: {e}"))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("{jar}: {e}"))?;
+    let referenced = referenced_equipment(items, namespace, |name| {
+        let mut bytes = Vec::new();
+        zip.by_name(name).ok()?.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
+    });
     let mut copied = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().map_err(|e| e.to_string())?.into_owned();
-        if entry.is_dir() || !carried(&name, namespace) || name.contains("..") {
+        if entry.is_dir() || !carried(&name, namespace, &referenced) || name.contains("..") {
             continue;
         }
         copied += entry.size();
@@ -261,21 +323,89 @@ mod tests {
     #[test]
     fn only_the_namespace_and_shared_tags_are_carried() {
         let ns = "emerald-tools-justfatlard";
+        let none = BTreeSet::new();
         assert!(carried(
             "assets/emerald-tools-justfatlard/models/item/emerald_axe.json",
-            ns
+            ns,
+            &none
         ));
         assert!(carried(
             "data/emerald-tools-justfatlard/recipe/emerald_axe.json",
-            ns
+            ns,
+            &none
         ));
-        assert!(carried("data/minecraft/tags/item/pickaxes.json", ns));
-        assert!(!carried("data/minecraft/advancement/story/x.json", ns));
-        assert!(!carried("assets/minecraft/textures/x.png", ns));
+        assert!(carried("data/minecraft/tags/item/pickaxes.json", ns, &none));
+        assert!(!carried(
+            "data/minecraft/advancement/story/x.json",
+            ns,
+            &none
+        ));
+        assert!(!carried("assets/minecraft/textures/x.png", ns, &none));
         assert!(!carried(
             "data/emerald-tools-justfatlard/horizon/item/x.json",
-            ns
+            ns,
+            &none
         ));
-        assert!(!carried("fabric.mod.json", ns));
+        assert!(!carried("fabric.mod.json", ns, &none));
+    }
+
+    fn armor_item(id: &str, asset: &str) -> RegisteredItem {
+        let mut components = serde_json::Map::new();
+        components.insert(
+            "minecraft:equippable".into(),
+            serde_json::json!({"slot": "head", "asset_id": asset}),
+        );
+        RegisteredItem {
+            id: id.into(),
+            template: "minecraft:iron_helmet".into(),
+            components,
+            max_stack_size: None,
+            rarity: None,
+        }
+    }
+
+    #[test]
+    fn worn_armour_assets_in_minecraft_are_carried_with_their_textures() {
+        let ns = "gems";
+        let items = [armor_item("gems:ruby_helmet", "minecraft:ruby")];
+        let jar = |name: &str| match name {
+            "assets/minecraft/equipment/ruby.json" => Some(
+                br#"{"layers": {
+                    "humanoid": [{"texture": "minecraft:ruby_armor"}],
+                    "humanoid_leggings": [{"texture": "minecraft:ruby_armor"}],
+                    "wings": [{"texture": "gems:ruby_wings"}, {"texture": "other:x"}]}}"#
+                    .to_vec(),
+            ),
+            _ => None,
+        };
+        let referenced = referenced_equipment(&items, ns, jar);
+        let expected = [
+            "assets/gems/textures/entity/equipment/wings/ruby_wings.png",
+            "assets/minecraft/equipment/ruby.json",
+            "assets/minecraft/textures/entity/equipment/humanoid/ruby_armor.png",
+            "assets/minecraft/textures/entity/equipment/humanoid_leggings/ruby_armor.png",
+        ];
+        assert_eq!(
+            referenced.iter().map(String::as_str).collect::<Vec<_>>(),
+            expected
+        );
+        for name in expected {
+            assert!(carried(name, ns, &referenced), "{name}");
+        }
+        // Only what the items name: vanilla's other files and models stay out.
+        assert!(!carried(
+            "assets/minecraft/equipment/iron.json",
+            ns,
+            &referenced
+        ));
+        assert!(!carried(
+            "assets/minecraft/textures/block/stone.png",
+            ns,
+            &referenced
+        ));
+        // An asset the jar does not hold, or another mod's namespace, names nothing.
+        assert!(referenced_equipment(&items, ns, |_| None).is_empty());
+        let foreign = [armor_item("gems:a", "other:ruby")];
+        assert!(referenced_equipment(&foreign, ns, jar).is_empty());
     }
 }

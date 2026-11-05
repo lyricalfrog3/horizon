@@ -317,7 +317,11 @@ data, and client prediction of its clicks.
 The fence: files go in the mod's own namespaces (`assets/<id>/`,
 `data/<id>/`, and those its manifest lists), plus additions to vanilla tags
 (`data/minecraft/tags/`) and to the convention tags NeoForge and Fabric mods
-share (`data/c/tags/`).
+share (`data/c/tags/`), plus worn armour in vanilla's namespace: equipment assets
+(`assets/minecraft/equipment/*.json`) and the textures their layers name
+(`assets/minecraft/textures/entity/equipment/`), which is where an item's `minecraft:equippable` `asset_id`
+(`minecraft:ruby`) and a layer's texture id resolve. A file vanilla already has is left out (with a warning in the log),
+never replaced.
 Templates and `sounds` name vanilla blocks; unknown keys are refused.
 
 Some Java mods ship their files under other names than their mod id (Towns and Towers, mod id `t_and_t`, under

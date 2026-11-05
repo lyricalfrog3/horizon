@@ -50,6 +50,15 @@ pub fn check_path(name: &str) -> Result<(), String> {
 }
 
 /// A vanilla identifier, `minecraft:path`.
+/// Whether `rest` (below `assets/minecraft/`) is worn-armour data a mod may add to vanilla's
+/// namespace: an equipment asset (`equipment/*.json`) or a texture a layer names
+/// (`textures/entity/equipment/**.png`), which vanilla's `minecraft:equippable` `asset_id`
+/// and layer texture ids resolve there. The game leaves out any such file vanilla already has.
+fn worn_equipment(rest: &str) -> bool {
+    (rest.starts_with("equipment/") && rest.ends_with(".json"))
+        || (rest.starts_with("textures/entity/equipment/") && rest.ends_with(".png"))
+}
+
 /// `Identifier.isValidNamespace` and `isValidPath` on an id with both parts
 /// given: `[a-z0-9_.-]`, and `/` in the path too.
 fn namespaced_id(id: &str) -> bool {
@@ -665,7 +674,9 @@ impl Content {
             // Vanilla's own files stay vanilla's; a mod may only add to its
             // tags, and to the convention tags mods share.
             let shared = matches!(namespace, "minecraft" | "c");
-            let allowed = owned || (top == "data" && shared && rest.starts_with("tags/"));
+            let allowed = owned
+                || (top == "data" && shared && rest.starts_with("tags/"))
+                || (top == "assets" && namespace == "minecraft" && worn_equipment(rest));
             if !allowed {
                 return Err(format!(
                     "{name}: a mod adds files in its own namespaces ({top}/{id}/ and those listed in namespaces) or to vanilla and convention (c) tags"
@@ -1282,6 +1293,23 @@ capabilities = ["registries"]
         let files: &[(&str, &[u8])] = &[("data/ruby/horizon/block/cable.json", cable)];
         let e = hmod("bare-tag", MANIFEST_TEXT, files).unwrap_err();
         assert!(e.contains("#namespace:path"), "{e}");
+    }
+
+    #[test]
+    fn a_mod_may_add_worn_armour_to_the_minecraft_namespace() {
+        let files: &[(&str, &[u8])] = &[
+            ("assets/minecraft/equipment/ruby.json", b"{}"),
+            (
+                "assets/minecraft/textures/entity/equipment/humanoid/ruby_armor.png",
+                b"png",
+            ),
+            (
+                "assets/minecraft/textures/entity/equipment/humanoid_leggings/ruby_armor.png",
+                b"png",
+            ),
+        ];
+        let content = hmod("worn-armour", MANIFEST_TEXT, files).unwrap();
+        assert_eq!(content.files.len(), 3);
     }
 
     #[test]
@@ -1903,6 +1931,10 @@ capabilities = ["registries"]
         refused(
             "vanilla-asset",
             &[("assets/minecraft/textures/block/stone.png", b"x")],
+        );
+        refused(
+            "vanilla-equipment-model",
+            &[("assets/minecraft/models/item/iron_helmet.json", b"{}")],
         );
         refused(
             "vanilla-recipe",

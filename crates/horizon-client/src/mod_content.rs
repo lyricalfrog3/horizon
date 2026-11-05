@@ -2408,6 +2408,15 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
                 let merge = tags.entry(file.clone()).or_default();
                 warnings.extend(merge.add(&m.id, file, replace, shared, values));
             } else if !declarations.iter().any(|d| file.starts_with(d)) {
+                // What a mod adds to `minecraft` (worn-armour assets) never replaces
+                // vanilla's own file.
+                if file.starts_with("assets/minecraft/") && base.join(file).exists() {
+                    warnings.push(format!(
+                        "mod {}: {file} left out: vanilla has it",
+                        m.id
+                    ));
+                    continue;
+                }
                 overlay.write(file, &bytes)?;
                 if biomes::is_modifier(file) {
                     let text = String::from_utf8(bytes).map_err(|e| format!("{file}: {e}"))?;
