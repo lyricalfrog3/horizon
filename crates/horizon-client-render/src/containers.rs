@@ -55,6 +55,54 @@ pub fn mod_menu_type(id: &str) -> Option<&'static ModMenuType> {
     mod_menu_types().iter().find(|m| m.id == id)
 }
 
+/// A content mod block's declared container (`container` in a block's file).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredContainer {
+    /// Its slots and menu, with every slot open to every face, hopper
+    /// insertion and extraction, as `BaseContainerBlockEntity` is without
+    /// `WorldlyContainer`.
+    pub container: ModContainer,
+    /// The menu's title as a literal; the block's name when none.
+    pub title: Option<String>,
+}
+
+static BLOCK_CONTAINERS: std::sync::OnceLock<
+    std::collections::HashMap<String, std::sync::Arc<DeclaredContainer>>,
+> = std::sync::OnceLock::new();
+
+/// registers the content mods' block containers, `(block, slots, menu,
+/// title)`, a list set once per process (false when it already was).
+pub fn register_block_containers(
+    blocks: impl IntoIterator<Item = (String, usize, String, Option<String>)>,
+) -> bool {
+    if BLOCK_CONTAINERS.get().is_some() {
+        return false;
+    }
+    let blocks = blocks
+        .into_iter()
+        .map(|(block, slots, menu, title)| {
+            let all: Vec<usize> = (0..slots).collect();
+            let container = ModContainer {
+                slots,
+                faces: std::array::from_fn(|_| all.clone()),
+                inputs: all.clone(),
+                outputs: all,
+                menu: Some(menu),
+            };
+            (
+                block,
+                std::sync::Arc::new(DeclaredContainer { container, title }),
+            )
+        })
+        .collect();
+    BLOCK_CONTAINERS.set(blocks).is_ok()
+}
+
+/// the container a content mod's block `name` declares.
+pub fn block_container(name: &str) -> Option<&'static std::sync::Arc<DeclaredContainer>> {
+    BLOCK_CONTAINERS.get()?.get(name)
+}
+
 /// whether a client of `brand` can be sent menu type `menu`: a vanilla
 /// client reads the type through `ByteBufCodecs.registry(Registries.MENU)`,
 /// and an id it lacks (`IdMap.byIdOrThrow`) disconnects it, so it is sent

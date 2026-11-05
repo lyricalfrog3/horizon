@@ -6,6 +6,8 @@
 use super::Game;
 use horizon_client::items::ItemStack;
 use horizon_client::text::Text;
+use horizon_world::level::PlacementContext;
+use horizon_world::registry::BlockStateId;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,12 +19,12 @@ mod keys;
 mod menu;
 mod textures;
 
+pub(super) use content::fabric_content_mods;
 pub(super) use gui::{
     apply_fabric_host_requests, fabric_screen_char, fabric_screen_close_current,
     fabric_screen_draws, fabric_screen_key, fabric_screen_mouse, fabric_screen_mouse_moved,
     fabric_screen_open, fabric_screen_scroll, replay_fabric_draws, translate_draw,
 };
-pub(super) use content::fabric_content_mods;
 pub(super) use menu::{draw_menu_widgets, menu_widget_press};
 
 #[allow(unused_imports)]
@@ -47,8 +49,16 @@ pub(super) fn set_fabric_resources(dir: PathBuf) {
     let _ = RESOURCES.set(dir);
 }
 
+static BRIDGE: OnceLock<Mutex<hfc_runtime::bridge::FabricBridge>> = OnceLock::new();
+
+/// The bridge if something already started it. A world hook that runs for
+/// every block placed asks this, so a game without Fabric mods never pays for
+/// starting the runtime on a placement.
+fn started_fabric_bridge() -> Option<&'static Mutex<hfc_runtime::bridge::FabricBridge>> {
+    BRIDGE.get()
+}
+
 fn get_fabric_bridge() -> &'static Mutex<hfc_runtime::bridge::FabricBridge> {
-    static BRIDGE: OnceLock<Mutex<hfc_runtime::bridge::FabricBridge>> = OnceLock::new();
     BRIDGE.get_or_init(|| {
         let mut bridge = hfc_runtime::bridge::FabricBridge::new();
         add_vanilla_classes(&mut bridge);
@@ -292,6 +302,21 @@ impl hfc_runtime::bridge::HostBridge for HostBridgeAdapter<'_, '_> {
     fn held_item(&self) -> Option<String> {
         self.0.held().map(|s| s.item.to_string())
     }
+    fn block_properties(&self, pos: [i32; 3]) -> Vec<(String, String)> {
+        let state = self.0.world.block(pos[0], pos[1], pos[2]);
+        self.0
+            .pack
+            .assets
+            .registry
+            .state(state)
+            .map(|s| {
+                s.properties
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     fn held_enchantments(&self) -> Vec<(String, i32)> {
         self.0
             .held()
@@ -352,6 +377,101 @@ impl Game<'_> {
             let mut adapter = HostBridgeAdapter(self);
             if bridge.right_click_block(&mut adapter, &event) == hfc_runtime::bridge::Flow::Cancel {
                 *canceled = true;
+            }
+        }
+    }
+
+    /// A player placed a Fabric block: run the block's own `onPlace` and
+    /// `setPlacedBy` over the world around it, and set the blocks they set (a
+    /// bed's other cell) through the host, as `Level.setBlock` from the
+    /// mod's code would. Server-side only; `click` is the click that placed it.
+    pub(super) fn fabric_block_placed(
+        &mut self,
+        click: &horizon_world::level::PlaceContext,
+        target: [i32; 3],
+        state: BlockStateId,
+    ) {
+        use hfc_runtime::bridge::PlacedBy;
+        if self.serving.is_none() && self.options.dedicated.is_none() {
+            return;
+        }
+        let Some(bridge) = started_fabric_bridge() else {
+            return;
+        };
+        let Some(placed) = self.pack.assets.registry.state(state) else {
+            return;
+        };
+        let block = placed.name.to_string();
+        let properties: std::collections::BTreeMap<String, String> = placed
+            .properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let clicked = [
+            click.clicked_pos.x,
+            click.clicked_pos.y,
+            click.clicked_pos.z,
+        ];
+        let request = hfc_runtime::bridge::PlacementRequest {
+            block: block.clone(),
+            pos: target,
+            hit_pos: clicked,
+            face: click.face.normal(),
+            hit: [click.hit.x, click.hit.y, click.hit.z],
+            inside: click.inside,
+            yaw: click.yaw,
+            pitch: click.pitch,
+            player_pos: self
+                .player
+                .as_ref()
+                .map_or([0.0; 3], |p| [p.position.x, p.position.y, p.position.z]),
+            sneaking: click.sneaking,
+            off_hand: self.hand == crate::first_person::Hand::Off,
+            item: click.item.clone(),
+            replace_clicked: clicked == target,
+        };
+        // The bridge is released before the blocks are set: setting one can
+        // raise events that lock it again.
+        let result = match bridge.lock() {
+            Ok(mut bridge) => {
+                let adapter = HostBridgeAdapter(self);
+                bridge.block_placed(&adapter, &request, &properties)
+            }
+            Err(_) => return,
+        };
+        match result {
+            PlacedBy::NotOverridden => {}
+            PlacedBy::Failed(error) => {
+                log::warn!("Fabric: {block}'s setPlacedBy failed: {error}");
+            }
+            PlacedBy::Changes(changes) => {
+                let dimension = self.dim.id().to_string();
+                for change in changes {
+                    let Some(default) = self.pack.assets.registry.default_state(&change.block)
+                    else {
+                        log::warn!(
+                            "Fabric: {block} set {}, which is not a block here",
+                            change.block
+                        );
+                        continue;
+                    };
+                    let Some(id) =
+                        placed_state(self.pack.assets.registry, default, &change.properties)
+                    else {
+                        log::warn!(
+                            "Fabric: {block} set {} {:?}, which is none of its states",
+                            change.block,
+                            change.properties
+                        );
+                        continue;
+                    };
+                    self.native_set_block(
+                        &dimension,
+                        change.pos,
+                        id,
+                        horizon_world::level::flags::UPDATE_ALL,
+                    );
+                }
             }
         }
     }
@@ -472,5 +592,157 @@ impl Game<'_> {
             width,
             height,
         )
+    }
+}
+
+impl super::GameLevel<'_> {
+    /// The state a Fabric block is placed in, from its real
+    /// `getStateForPlacement` run over this click. Asked for every block
+    /// placed (`before_state_for_placement`); `answer` stays empty for a block
+    /// no Fabric mod registered or one that keeps vanilla's placement. A mod
+    /// that returns null refuses the placement; a state that has no Horizon
+    /// state is logged and the block is placed as the host would place it.
+    pub(super) fn fabric_state_for_placement(
+        &self,
+        state: BlockStateId,
+        context: &PlacementContext,
+        answer: &mut Option<Option<BlockStateId>>,
+    ) {
+        use hfc_runtime::bridge::Placement;
+        if answer.is_some() {
+            return;
+        }
+        let Some(block) = self.native_state_block(state) else {
+            return;
+        };
+        let Some(bridge) = started_fabric_bridge() else {
+            return;
+        };
+        // The local player's feet, from its box; the click point where the
+        // level has no player box (a placement for a guest).
+        let player_pos = self.player_box.map_or(
+            [context.hit.x, context.hit.y, context.hit.z],
+            |(min, max)| [(min[0] + max[0]) / 2.0, min[1], (min[2] + max[2]) / 2.0],
+        );
+        let request = hfc_runtime::bridge::PlacementRequest {
+            block: block.to_owned(),
+            pos: [context.pos.x, context.pos.y, context.pos.z],
+            hit_pos: [context.hit_pos.x, context.hit_pos.y, context.hit_pos.z],
+            face: context.face.normal(),
+            hit: [context.hit.x, context.hit.y, context.hit.z],
+            inside: context.inside,
+            yaw: context.yaw,
+            pitch: context.pitch,
+            player_pos,
+            sneaking: context.sneaking,
+            // The placement context does not say which hand placed it.
+            off_hand: false,
+            item: context.item.clone(),
+            replace_clicked: context.replace_clicked,
+        };
+        let Ok(mut bridge) = bridge.lock() else {
+            return;
+        };
+        match bridge.state_for_placement(&PlacementWorld(self), &request) {
+            Placement::NotOverridden => {}
+            Placement::Refused => *answer = Some(None),
+            Placement::State(properties) => match placed_state(self.registry, state, &properties) {
+                Some(placed) => *answer = Some(Some(placed)),
+                None => log::warn!(
+                    "Fabric: {block} chose {properties:?} when placed, which is none of its states"
+                ),
+            },
+            Placement::Failed(error) => {
+                log::warn!("Fabric: {block}'s getStateForPlacement failed: {error}");
+            }
+        }
+    }
+}
+
+/// What a Fabric block's own world reads while it is placed: the host's real
+/// blocks. It only reads.
+struct PlacementWorld<'a, 'b>(&'a super::GameLevel<'b>);
+
+impl hfc_runtime::bridge::HostBridge for PlacementWorld<'_, '_> {
+    fn block(&self, pos: [i32; 3]) -> String {
+        let state = self.0.world.block(pos[0], pos[1], pos[2]);
+        self.0.facts.get(state).name.to_string()
+    }
+    fn block_property(&self, pos: [i32; 3], key: &str) -> Option<String> {
+        let state = self.0.world.block(pos[0], pos[1], pos[2]);
+        self.0.registry.state(state)?.properties.get(key).cloned()
+    }
+    fn set_block_property(&mut self, _: [i32; 3], _: &str, _: &str) -> bool {
+        false
+    }
+    fn give(&mut self, _: &str, _: u32) -> Result<(), String> {
+        Err("placement does not give items".into())
+    }
+    fn block_properties(&self, pos: [i32; 3]) -> Vec<(String, String)> {
+        let state = self.0.world.block(pos[0], pos[1], pos[2]);
+        self.0
+            .registry
+            .state(state)
+            .map(|s| {
+                s.properties
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The state of `state`'s block whose properties are `properties` (every
+/// property the block has, as `getStateForPlacement` leaves them); none when
+/// the block has no such state.
+fn placed_state(
+    registry: &horizon_world::registry::BlockRegistry,
+    state: BlockStateId,
+    properties: &std::collections::BTreeMap<String, String>,
+) -> Option<BlockStateId> {
+    let mut wanted = registry.state(state)?.clone();
+    for (name, value) in properties {
+        // A property the block lacks is a state it does not have.
+        wanted.properties.get(name)?;
+        wanted
+            .properties
+            .insert(name.as_str().into(), value.as_str().into());
+    }
+    registry.resolve(&wanted).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::placed_state;
+    use horizon_world::registry::{BlockRegistry, BlockStateId};
+    use std::collections::BTreeMap;
+
+    /// A mod block with a `facing` property is placed in the state the mod
+    /// chose, not its default; a value or property the block lacks is none.
+    #[test]
+    fn a_chosen_placement_state_is_found_in_the_registry() {
+        let facts = br#"{"defaults":{"minecraft:air":0,"test:cabinet":1},"states":[
+            ["air",true,false,"","minecraft:air"],
+            ["north",false,false,"",{"id":"test:cabinet","properties":{"facing":"north"}}],
+            ["south",false,false,"",{"id":"test:cabinet","properties":{"facing":"south"}}],
+            ["east",false,false,"",{"id":"test:cabinet","properties":{"facing":"east"}}]
+        ]}"#;
+        let registry = BlockRegistry::from_facts_json(&facts[..]).unwrap();
+        let default = BlockStateId(1);
+        let want = |k: &str, v: &str| BTreeMap::from([(k.to_owned(), v.to_owned())]);
+        assert_eq!(
+            placed_state(&registry, default, &want("facing", "east")),
+            Some(BlockStateId(3))
+        );
+        assert_eq!(
+            placed_state(&registry, default, &want("facing", "south")),
+            Some(BlockStateId(2))
+        );
+        assert_eq!(
+            placed_state(&registry, default, &want("facing", "up")),
+            None
+        );
+        assert_eq!(placed_state(&registry, default, &want("half", "top")), None);
     }
 }

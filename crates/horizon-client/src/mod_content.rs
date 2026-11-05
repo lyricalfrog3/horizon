@@ -17,8 +17,8 @@
 use crate::{Result, blocks::MAP_COLORS};
 use horizon_core::geometry::{Aabb, Axis, ShapeOp, Vec3, VoxelShape};
 use horizon_mods::content::{
-    Block, Content, CreativeTab, EntityType, MenuType, MobEffect, Rarity, StateProperty,
-    TabEntries, TabPlacement,
+    Block, BlockContainer, BlockShapes, Content, CreativeTab, EntityType, MenuType, MobEffect, Rarity,
+    StateProperty, TabEntries, TabPlacement,
 };
 use horizon_world::nbt::{self, Compound, JavaString, Limits, Tag};
 use serde::{Deserialize, Serialize, de};
@@ -93,6 +93,17 @@ pub fn menu_types(mods: &[ContentMod]) -> Vec<&MenuType> {
     let mut menus: Vec<&MenuType> = mods.iter().flat_map(|m| &m.content.menu_types).collect();
     menus.sort_by(|a, b| a.id.cmp(&b.id));
     menus
+}
+
+/// the blocks the mods give a container, `(block id, container)`, in id order.
+pub fn block_containers(mods: &[ContentMod]) -> Vec<(&str, &BlockContainer)> {
+    let mut blocks: Vec<_> = mods
+        .iter()
+        .flat_map(|m| &m.content.blocks)
+        .filter_map(|b| Some((b.id.as_str(), b.container.as_ref()?)))
+        .collect();
+    blocks.sort_by_key(|(id, _)| *id);
+    blocks
 }
 
 /// JSON with its object keys in file order, so a rewritten table differs
@@ -220,6 +231,12 @@ impl J {
     }
     fn f64(v: f64) -> J {
         serde_json::Number::from_f64(v).map_or(J::Null, J::Num)
+    }
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            J::Num(n) => n.as_f64(),
+            _ => None,
+        }
     }
     fn as_u32(&self) -> Option<u32> {
         match self {
@@ -532,6 +549,54 @@ fn shape_edges(shape: &VoxelShape) -> Vec<J> {
     result
 }
 
+/// A shape's boxes as a gameplay row's `outline` holds them.
+fn shape_boxes(shape: &VoxelShape) -> Vec<J> {
+    shape
+        .boxes()
+        .iter()
+        .map(|b| {
+            J::Arr(
+                [
+                    b.min(Axis::X),
+                    b.min(Axis::Y),
+                    b.min(Axis::Z),
+                    b.max(Axis::X),
+                    b.max(Axis::Y),
+                    b.max(Axis::Z),
+                ]
+                .into_iter()
+                .map(J::f64)
+                .collect(),
+            )
+        })
+        .collect()
+}
+
+/// The union of a gameplay row's `outline` boxes.
+fn shape_of_rows(boxes: &[J]) -> Result<VoxelShape> {
+    let mut shape = VoxelShape::empty();
+    for b in boxes {
+        let J::Arr(n) = b else {
+            return Err("an outline box is not a list".into());
+        };
+        let n: Vec<f64> = n.iter().filter_map(J::as_f64).collect();
+        if n.len() != 6 {
+            return Err("an outline box is not six numbers".into());
+        }
+        let part = VoxelShape::from_box(Aabb::new(
+            Vec3::new(n[0], n[1], n[2]),
+            Vec3::new(n[3], n[4], n[5]),
+        ))?;
+        shape = shape.join_unoptimized(&part, ShapeOp::OR)?;
+    }
+    Ok(shape)
+}
+
+/// `Block.isShapeFullBlock`.
+fn full_block(shape: &VoxelShape) -> Result<bool> {
+    Ok(!shape.join_is_not_empty(&VoxelShape::block(), ShapeOp::XOR)?)
+}
+
 fn encode_shape(shape: &VoxelShape) -> Tag {
     let mut c = nbt::Compound::new();
     let (min, max) = shape.discrete_bounds();
@@ -569,13 +634,110 @@ fn encode_shape(shape: &VoxelShape) -> Tag {
     Tag::Compound(c)
 }
 
+/// A block's shape per state: `unique[of[row]]`, `row` counting its states
+/// in registry order (`NewBlock::order`). States with the same boxes share one.
+#[derive(Clone)]
+struct StateShapes {
+    unique: Vec<VoxelShape>,
+    of: Vec<u32>,
+}
+impl StateShapes {
+    fn get(&self, row: usize) -> &VoxelShape {
+        &self.unique[self.of[row] as usize]
+    }
+}
+
+/// The shapes a `shapes` (or `collision`) map gives each state of a block, in
+/// registry order: `order` holds each state's template state (as an offset)
+/// and combination of declared values, `template` the template state's
+/// properties. Every state needs an entry, and every entry a state.
+fn declared_shapes<'a>(
+    spec: &BlockShapes,
+    order: &[(u32, u32)],
+    combos: &[Vec<(String, String)>],
+    template: impl Fn(u32) -> Option<&'a J>,
+) -> std::result::Result<StateShapes, String> {
+    let mut index: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut unique = Vec::new();
+    let mut of = Vec::with_capacity(order.len());
+    for &(state, combo) in order {
+        let props = template(state);
+        let combo = &combos[combo as usize];
+        let value = |name: &str| -> Option<&str> {
+            combo
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+                .or_else(|| match props?.get(name)? {
+                    J::Str(v) => Some(v.as_str()),
+                    _ => None,
+                })
+        };
+        let key = spec.key(value)?;
+        let (key, boxes) = spec
+            .values
+            .get_key_value(&key)
+            .ok_or_else(|| format!("no shape for {key}"))?;
+        let at = match index.get(key.as_str()) {
+            Some(at) => *at,
+            None => {
+                let mut shape = VoxelShape::empty();
+                for b in boxes {
+                    let part = VoxelShape::from_box(Aabb::new(
+                        Vec3::new(b[0], b[1], b[2]),
+                        Vec3::new(b[3], b[4], b[5]),
+                    ))
+                    .map_err(|e| e.to_string())?;
+                    shape = shape
+                        .join_unoptimized(&part, ShapeOp::OR)
+                        .map_err(|e| e.to_string())?;
+                }
+                unique.push(shape);
+                let at = unique.len() as u32 - 1;
+                index.insert(key, at);
+                at
+            }
+        };
+        of.push(at);
+    }
+    if index.len() != spec.values.len() {
+        let unused: Vec<&String> = spec
+            .values
+            .keys()
+            .filter(|k| !index.contains_key(k.as_str()))
+            .collect();
+        return Err(format!("shape values name no state: {unused:?}"));
+    }
+    // Shapes that came out equal from different keys share one entry.
+    let mut merged: Vec<VoxelShape> = Vec::new();
+    let mut remap = Vec::with_capacity(unique.len());
+    for shape in unique {
+        match merged.iter().position(|m| m.boxes() == shape.boxes()) {
+            Some(at) => remap.push(at as u32),
+            None => {
+                merged.push(shape);
+                remap.push(merged.len() as u32 - 1);
+            }
+        }
+    }
+    Ok(StateShapes {
+        unique: merged,
+        of: of.into_iter().map(|at| remap[at as usize]).collect(),
+    })
+}
+
 /// A block being added: its declaration and where its states go.
 struct NewBlock<'a> {
     decl: &'a Block,
     rename: Rename,
     /// The template's item, if it has one.
     item: Option<String>,
-    shapes: Option<Vec<VoxelShape>>,
+    /// Its own outline (`shapes`, or a connecting block's), the template's when `None`.
+    outline: Option<StateShapes>,
+    /// Its own collision: `collision`, else the outline above.
+    collision: Option<StateShapes>,
+    /// Whether each template state occludes (`can_occlude` of its gameplay row).
+    occluding: Vec<bool>,
     default: u32,
     /// The declared state properties' combinations, every property at its
     /// default first (one empty combination when the block declares none):
@@ -589,6 +751,22 @@ struct NewBlock<'a> {
     wall_of: Option<String>,
 }
 impl NewBlock<'_> {
+    /// Whether its states occlude: never with `can_occlude: false`, else as
+    /// the template state does.
+    fn occludes(&self, template: bool) -> bool {
+        template && self.decl.properties.can_occlude != Some(false)
+    }
+    /// Whether template state `id` occludes (its gameplay row's `can_occlude`).
+    fn template_occludes(&self, id: u32) -> bool {
+        self.occluding
+            .get((id - self.rename.states.start) as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+    /// Whether its occlusion table rows are its own (see `Plan::occlusion_facts`).
+    fn own_occlusion(&self) -> bool {
+        self.outline.is_some() || self.decl.properties.can_occlude == Some(false)
+    }
     /// Template states and declared combinations in registry order.
     fn state_combinations(&self) -> impl Iterator<Item = (u32, &[(String, String)])> {
         let start = self.rename.states.start;
@@ -891,66 +1069,6 @@ impl<'a> Plan<'a> {
                 let states = range(&decl.template).ok_or_else(|| {
                     format!("{}: template {} is not a block", decl.id, decl.template)
                 })?;
-                let shapes = if let Some(spec) = &decl.shapes {
-                    let Some(J::Arr(rows)) = facts.get("states") else {
-                        unreachable!()
-                    };
-                    let mut used = BTreeSet::new();
-                    let mut out = Vec::new();
-                    for id in states.clone() {
-                        let J::Arr(row) = &rows[id as usize] else {
-                            unreachable!()
-                        };
-                        let Some(J::Str(value)) = row
-                            .get(4)
-                            .and_then(|x| x.get("properties"))
-                            .and_then(|x| x.get(&spec.property))
-                        else {
-                            return Err(format!(
-                                "{}: template state lacks property {}",
-                                decl.id, spec.property
-                            )
-                            .into());
-                        };
-                        let boxes = spec.values.get(value).ok_or_else(|| {
-                            format!("{}: no shape for {}={value}", decl.id, spec.property)
-                        })?;
-                        used.insert(value.as_str());
-                        let mut shape = VoxelShape::empty();
-                        for b in boxes {
-                            let part = VoxelShape::from_box(Aabb::new(
-                                Vec3::new(b[0], b[1], b[2]),
-                                Vec3::new(b[3], b[4], b[5]),
-                            ))?;
-                            shape = shape.join_unoptimized(&part, ShapeOp::OR)?;
-                        }
-                        out.push(shape);
-                    }
-                    if used.len() != spec.values.len() {
-                        return Err(format!(
-                            "{}: shape values include an unknown {} value",
-                            decl.id, spec.property
-                        )
-                        .into());
-                    }
-                    Some(out)
-                } else if let Some(size) = decl.thickness {
-                    let Some(J::Arr(rows)) = facts.get("states") else {
-                        unreachable!()
-                    };
-                    let shapes = states.clone().map(|id| {
-                        let props = match &rows[id as usize] {
-                            J::Arr(row) => row.get(4).and_then(|p| p.get("properties")),
-                            _ => None,
-                        };
-                        let sides = ["down", "up", "north", "south", "west", "east"]
-                            .map(|k| matches!(props.and_then(|p| p.get(k)), Some(J::Str(v)) if v == "true"));
-                        horizon_world::collision::pipe_shape(size.into(), sides)
-                    });
-                    Some(shapes.collect::<std::io::Result<_>>()?)
-                } else {
-                    None
-                };
                 let mut default = *defaults.get(&decl.template).ok_or_else(|| {
                     format!(
                         "{}: template {} has no default state",
@@ -1038,6 +1156,35 @@ impl<'a> Plan<'a> {
                     .map(|(name, property)| (name.clone(), property.values().len() as u32))
                     .collect();
                 let order = block_order(&states, properties, &declared, combos.len() as u32);
+                // Shapes per state, in registry order: a declared map picks each state's
+                // boxes by its values (the template's and its own), a connecting block
+                // builds them from its template state's sides.
+                let shaped = |spec: &BlockShapes| {
+                    declared_shapes(spec, &order, &combos, |at| properties(states.start + at))
+                        .map_err(|e| format!("{}: {e}", decl.id))
+                };
+                let outline = match (&decl.shapes, decl.thickness) {
+                    (Some(spec), _) => Some(shaped(spec)?),
+                    (None, Some(size)) => {
+                        let mut by_state = Vec::new();
+                        for id in states.clone() {
+                            let sides = ["down", "up", "north", "south", "west", "east"].map(|k| {
+                                matches!(properties(id).and_then(|p| p.get(k)), Some(J::Str(v)) if v == "true")
+                            });
+                            by_state
+                                .push(horizon_world::collision::pipe_shape(size.into(), sides)?);
+                        }
+                        Some(StateShapes {
+                            of: order.iter().map(|&(state, _)| state).collect(),
+                            unique: by_state,
+                        })
+                    }
+                    (None, None) => None,
+                };
+                let collision = match &decl.collision {
+                    Some(spec) => Some(shaped(spec)?),
+                    None => outline.clone(),
+                };
                 // The lookup from (template state, combination) to the state's row.
                 let mut rows = vec![0; order.len()];
                 for (position, &(state, combo)) in order.iter().enumerate() {
@@ -1061,7 +1208,9 @@ impl<'a> Plan<'a> {
                     decl,
                     rename,
                     item: None,
-                    shapes,
+                    outline,
+                    collision,
+                    occluding: Vec::new(),
                     default,
                     combos,
                     order,
@@ -1108,6 +1257,12 @@ impl<'a> Plan<'a> {
         }
         let mut items = Vec::new();
         for b in &mut blocks {
+            b.occluding = b
+                .rename
+                .states
+                .clone()
+                .map(|id| matches!(rows[id as usize].get("can_occlude"), Some(J::Bool(true))))
+                .collect();
             let row = &rows[b.rename.states.start as usize];
             b.item = match row.get("item") {
                 Some(J::Str(i)) if i != "minecraft:air" => Some(i.clone()),
@@ -1199,7 +1354,6 @@ impl<'a> Plan<'a> {
             // One row per template state per combination the block declares,
             // so its states stay one run in registry order.
             for (next, (id, combo)) in (b.rename.first..).zip(b.state_combinations()) {
-                let t = (id - b.rename.states.start) as usize;
                 let mut row = list[id as usize].clone();
                 for r in &renames {
                     row.rename(r, ids);
@@ -1213,38 +1367,48 @@ impl<'a> Plan<'a> {
                         row.set("item", J::Str("minecraft:air".into()));
                     }
                     self.override_gameplay(b, combo, &mut row);
-                    if let Some(shapes) = &b.shapes {
-                        let shape = &shapes[t];
-                        let boxes = shape
-                            .boxes()
-                            .iter()
-                            .map(|b| {
-                                J::Arr(
-                                    [
-                                        b.min(Axis::X),
-                                        b.min(Axis::Y),
-                                        b.min(Axis::Z),
-                                        b.max(Axis::X),
-                                        b.max(Axis::Y),
-                                        b.max(Axis::Z),
-                                    ]
-                                    .into_iter()
-                                    .map(J::f64)
-                                    .collect(),
-                                )
-                            })
-                            .collect();
-                        row.set("outline", J::Arr(boxes));
+                    let at = (next - b.rename.first) as usize;
+                    if let Some(shapes) = &b.outline {
+                        let shape = shapes.get(at);
+                        row.set("outline", J::Arr(shape_boxes(shape)));
                         row.set("outline_edges", J::Arr(shape_edges(shape)));
-                        row.set(
-                            "full_collision",
-                            J::Bool(!shape.join_is_not_empty(&VoxelShape::block(), ShapeOp::XOR)?),
-                        );
                     }
+                    if let Some(shapes) = &b.collision {
+                        row.set("full_collision", J::Bool(full_block(shapes.get(at))?));
+                    }
+                    self.occlusion_facts(b, at, &mut row)?;
                 }
                 list.push(row);
             }
         }
+        Ok(())
+    }
+
+    /// A block whose occlusion is its own (`can_occlude: false`, or shapes
+    /// of its own): the gameplay row's occlusion and light facts, as
+    /// vanilla's `BlockStateBase.initCache` derives them from
+    /// `canOcclude` and the default `getOcclusionShape` (the outline):
+    /// `solidRender` is an occluding full block, `propagatesSkylightDown` a
+    /// non-full outline without fluid, and `getLightDampening` 15, 0 or 1.
+    fn occlusion_facts(&self, b: &NewBlock, at: usize, row: &mut J) -> Result<()> {
+        if b.outline.is_none() && b.decl.properties.can_occlude != Some(false) {
+            return Ok(());
+        }
+        let occludes = b.occludes(matches!(row.get("can_occlude"), Some(J::Bool(true))));
+        let outline = match &b.outline {
+            Some(shapes) => full_block(shapes.get(at))?,
+            None => match row.get("outline") {
+                Some(J::Arr(boxes)) => full_block(&shape_of_rows(boxes)?)?,
+                _ => false,
+            },
+        };
+        let solid = occludes && outline;
+        let skylight = !outline && !matches!(row.get("liquid"), Some(J::Bool(true)));
+        row.set("can_occlude", J::Bool(occludes));
+        row.set("solid_render", J::Bool(solid));
+        row.set("skylight_down", J::Bool(skylight));
+        let dampening = if solid { 15 } else { u32::from(!skylight) };
+        row.set("dampening", J::Num(dampening.into()));
         Ok(())
     }
 
@@ -1399,6 +1563,15 @@ impl<'a> Plan<'a> {
                             fields.set("connectsTo", J::Str(tag.clone()));
                             v.set("fields", fields);
                         }
+                        // A container opens its menu when used: a class of
+                        // its own, ahead of the template's.
+                        if b.decl.container.is_some() {
+                            let mut classes = vec![J::Str("HorizonContainerBlock".into())];
+                            if let Some(J::Arr(own)) = v.get("class") {
+                                classes.extend(own.iter().cloned());
+                            }
+                            v.set("class", J::Arr(classes));
+                        }
                         blocks.push(v);
                     }
                 }
@@ -1432,6 +1605,9 @@ impl<'a> Plan<'a> {
                                 )]),
                             );
                         }
+                    }
+                    if !model && b.decl.properties.can_occlude == Some(false) {
+                        entry.set("can_occlude", J::Bool(false));
                     }
                     if let Some(J::Arr(states)) = entry.get_mut("states") {
                         let template = states.clone();
@@ -1576,22 +1752,12 @@ impl<'a> Plan<'a> {
             return Err("collision table has no shapes".into());
         };
         for block in &self.blocks {
-            if let Some(shapes) = &block.shapes {
-                // One shape per template state, shared by every combination
-                // of it: the geometry is the template's, the properties are
-                // the block's.
-                let ids: Vec<i32> = shapes
-                    .iter()
-                    .map(|shape| {
-                        entries.push(encode_shape(shape));
-                        entries.len() as i32 - 1
-                    })
-                    .collect();
-                for (at, &shape) in ids.iter().enumerate() {
-                    for combination in 0..block.rename.fanout {
-                        let row = block.rename.row(at as u32, combination);
-                        indices.push((block.rename.first as usize + row as usize, shape));
-                    }
+            if let Some(shapes) = &block.collision {
+                // The states that share boxes share an entry.
+                let first = entries.len() as i32;
+                entries.extend(shapes.unique.iter().map(encode_shape));
+                for (row, &shape) in shapes.of.iter().enumerate() {
+                    indices.push((block.rename.first as usize + row, first + shape as i32));
                 }
             }
         }
@@ -1600,6 +1766,67 @@ impl<'a> Plan<'a> {
         };
         for (state, id) in indices {
             mapping[state] = id;
+        }
+        Ok(())
+    }
+
+    /// The occlusion shapes (`occlusion.nbt`, and the `occlusion` table and
+    /// block flags of `block-properties.nbt`) of the blocks whose occlusion
+    /// is their own: empty where they do not occlude, else their outline, as
+    /// vanilla's default `getOcclusionShape`.
+    fn occlusion_shapes(&self, tag: &mut Tag) -> Result<()> {
+        let Tag::Compound(root) = tag else {
+            return Err("occlusion table is not a compound".into());
+        };
+        // block-properties.nbt: the block flags' bit 16 is `canOcclude`.
+        if let Some(Tag::Compound(blocks)) = root.get_mut(&JavaString::from("blocks")) {
+            for b in &self.blocks {
+                if b.decl.properties.can_occlude == Some(false)
+                    && let Some(Tag::Byte(flags)) =
+                        blocks.get_mut(&JavaString::from(b.decl.id.as_str()))
+                {
+                    *flags &= !16;
+                }
+            }
+        }
+        let table = match root.get_mut(&JavaString::from("occlusion")) {
+            Some(Tag::Compound(nested)) => nested,
+            _ => root,
+        };
+        let Some(Tag::List(entries)) = table.get_mut(&JavaString::from("shapes")) else {
+            return Err("occlusion table has no shapes".into());
+        };
+        let mut indices = Vec::new();
+        let mut empty = None;
+        for b in self.blocks.iter().filter(|b| b.own_occlusion()) {
+            let mut outline_ids = BTreeMap::new();
+            for (row, (id, _)) in b.state_combinations().enumerate() {
+                let shape = match &b.outline {
+                    Some(shapes) if b.occludes(b.template_occludes(id)) => {
+                        let unique = shapes.of[row];
+                        *outline_ids.entry(unique).or_insert_with(|| {
+                            entries.push(encode_shape(&shapes.unique[unique as usize]));
+                            entries.len() as i32 - 1
+                        })
+                    }
+                    // Not occluding (or only its template's shape, which
+                    // `can_occlude: false` empties).
+                    _ if !b.occludes(b.template_occludes(id)) => *empty.get_or_insert_with(|| {
+                        entries.push(encode_shape(&VoxelShape::empty()));
+                        entries.len() as i32 - 1
+                    }),
+                    _ => continue,
+                };
+                indices.push((b.rename.first as usize + row, shape));
+            }
+        }
+        let Some(Tag::IntArray(mapping)) = table.get_mut(&JavaString::from("cached_shapes")) else {
+            return Err("occlusion table has no mapping".into());
+        };
+        for (state, id) in indices {
+            *mapping
+                .get_mut(state)
+                .ok_or("occlusion mapping shorter than the states")? = id;
         }
         Ok(())
     }
@@ -2331,6 +2558,9 @@ fn tables(base: &Path, plan: &Plan, overlay: &Overlay<'_>) -> Result<()> {
             if name == "cached-collision.nbt" || name == "worldgen/blocks/cached-collision.nbt" {
                 plan.collision_shapes(&mut named.tag)?;
             }
+            if name == "occlusion.nbt" || name == "worldgen/blocks/block-properties.nbt" {
+                plan.occlusion_shapes(&mut named.tag)?;
+            }
             nbt::write_named(&named, Limits::tables()).map_err(|e| format!("{name}: {e}"))?
         };
         overlay.write(name, &bytes)
@@ -2411,10 +2641,7 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
                 // What a mod adds to `minecraft` (worn-armour assets) never replaces
                 // vanilla's own file.
                 if file.starts_with("assets/minecraft/") && base.join(file).exists() {
-                    warnings.push(format!(
-                        "mod {}: {file} left out: vanilla has it",
-                        m.id
-                    ));
+                    warnings.push(format!("mod {}: {file} left out: vanilla has it", m.id));
                     continue;
                 }
                 overlay.write(file, &bytes)?;

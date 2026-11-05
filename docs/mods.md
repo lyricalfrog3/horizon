@@ -95,6 +95,10 @@ A block names its template and what differs from it:
   "item": true }
 ```
 
+`"can_occlude": false` in `properties` makes a block that never hides its neighbours' faces and lets light
+through, whatever its template does (vanilla's `noOcclusion()`), and `shapes` and `collision` give it its own
+outline and collision boxes per state ([modpacks.md](modpacks.md#registries-02-data-driven-blocks-items-and-mob-effects)).
+
 `random_ticks` makes a block tick randomly whatever its template does, as vanilla's
 `isRandomlyTicking(state)` does for its own blocks, so a crop, sapling or soil on a template that never
 ticks still grows: `"random_ticks": true` for every state (or `false`, to stop a template that ticks), or
@@ -214,6 +218,30 @@ the tag, on placement and whenever that neighbour changes. Its shapes are the
 chorus plant's (10 pixels across) unless it sets `"thickness"`, 2 to 14
 pixels: its outline and collision are then built as `PipeBlock` builds its
 own, a core and an arm to each joined side.
+
+A block with an inventory declares a `container`, for a block entity of
+vanilla's `BaseContainerBlockEntity` kind (a chest, a barrel) without a native
+mod:
+
+```json
+{ "template": "minecraft:barrel",
+  "container": { "slots": 27, "menu": "minecraft:generic_9x3", "title": "Storage" } }
+```
+
+`slots` is 1 to 256 and `menu` is the menu type it opens: one of vanilla's with
+as many slots (`minecraft:generic_9x1` to `generic_9x6`, `generic_3x3`,
+`hopper`, the furnaces; [native-mods.md](native-mods.md) lists them), or one of
+the mod's own [menu types](#menu-types) with the same `slots`. A mismatch is
+refused for a mod's own menu and, for a vanilla one, leaves the block a
+container that opens nothing (with a warning). `title` is a literal; without
+it the menu is titled by the block's name (`block.<id>.<path>`, from the
+lang files), as vanilla's default name is. Whatever the template, using the
+block opens the menu, the block entity is made when it is placed and its
+items are saved with the chunk. Breaking or replacing the block drops them, hoppers
+reach every slot from every side, and a comparator reads it as it reads a
+barrel. Not covered: a container's own `getMaxStackSize`, loot tables,
+ticking and per-slot rules; `native_block_entity_container` ([native-mods.md](native-mods.md))
+takes precedence when a native mod also declares one for the block.
 
 A mod's creative inventory tabs are `data/<ns>/horizon/creative_tab/*.json`:
 a title, the item on the tab's button, and its items in order (items the game

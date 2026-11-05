@@ -1573,17 +1573,12 @@ impl LootContext<'_> {
             _ => false,
         }
     }
+    /// The `condition` field of a pool, an entry or a modifier (26.3's
+    /// `LootPool`, `LootPoolEntryContainer` and `LootItemConditionalFunction`
+    /// codecs). Older formats' `conditions` list is an unknown field there,
+    /// which the codec ignores: such a pool rolls unconditionally in vanilla.
     fn conditions<R: RandomSource>(&self, o: &Value, random: &mut R) -> bool {
-        if let Some(c) = o.get("condition")
-            && !self.condition(c, random)
-        {
-            return false;
-        }
-        o.get("conditions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .all(|c| self.condition(c, random))
+        o.get("condition").is_none_or(|c| self.condition(c, random))
     }
     /// Expand entries; returns whether an entry succeeded (for alternatives).
     fn expand<R: RandomSource>(
@@ -2273,6 +2268,34 @@ mod tests {
         }
     }
 
+    /// 26.3's pools, entries and modifiers read one `condition` field (javap of
+    /// `LootPool`, `LootPoolEntryContainer`, `LootItemConditionalFunction`:
+    /// the codecs name "condition"). A table in an older format, with a
+    /// `conditions` list of `{"condition": kind}`, has an unknown field the
+    /// codec skips: its pool rolls with no condition, as in vanilla.
+    #[test]
+    fn an_older_formats_conditions_list_is_ignored_as_vanilla_does() {
+        let items = Items::for_tests(HashMap::new());
+        let props = horizon_world::chunk::BlockProperties::new();
+        let mut random = LegacyRandom::new(7);
+        let old = json!({"pools":[{"rolls":1.0,
+            "conditions":[{"condition":"minecraft:survives_explosion"}],
+            "entries":[{"type":"minecraft:item","name":"minecraft:stone",
+                "conditions":[{"condition":"minecraft:inverted","term":{"condition":"minecraft:survives_explosion"}}]}]}]});
+        let drops = ctx(&items, None, &props, "minecraft:stone").evaluate(&old, &mut random);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(&*drops[0].item, "minecraft:stone");
+        // The 26.3 field still decides: a condition that fails drops nothing.
+        let new = json!({"pools":[{"rolls":1,
+            "condition":{"type":"minecraft:inverted","term":{"type":"minecraft:survives_explosion"}},
+            "entries":[{"type":"minecraft:item","name":"minecraft:stone"}]}]});
+        assert!(
+            ctx(&items, None, &props, "minecraft:stone")
+                .evaluate(&new, &mut random)
+                .is_empty()
+        );
+    }
+
     /// A mod's kind nobody claims fails; a reference by name isn't a kind,
     /// and fails too.
     #[test]
@@ -2443,7 +2466,7 @@ mod tests {
             .sum();
         assert!(f64::from(looted) / f64::from(n) > f64::from(base) / f64::from(n) + 1.0);
         // Table bonus uses the chance for the tool's level.
-        let leaves = json!({"pools":[{"rolls":1,"conditions":[{"type":"minecraft:table_bonus","enchantment":"minecraft:fortune","chances":[0.0,0.0,0.0,1.0]}],"entries":[{"type":"minecraft:item","name":"minecraft:apple"}]}]});
+        let leaves = json!({"pools":[{"rolls":1,"condition":[{"type":"minecraft:table_bonus","enchantment":"minecraft:fortune","chances":[0.0,0.0,0.0,1.0]}],"entries":[{"type":"minecraft:item","name":"minecraft:apple"}]}]});
         assert_eq!(
             ctx(&items, Some(&pick), &props, "minecraft:oak_leaves")
                 .evaluate(&leaves, &mut random)

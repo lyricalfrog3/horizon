@@ -1615,6 +1615,7 @@ impl GameLevel<'_> {
             fluid,
             answer,
         );
+        self.fabric_state_for_placement(state, context, answer);
     }
 
     /// A block nothing in Horizon knows a `BonemealableBlock` for is about to
@@ -2768,6 +2769,13 @@ impl Game<'_> {
         container: &mut Option<ModContainer>,
     ) {
         mod_api::dispatch_block_entity_container(self, mod_api::mods(), block, container);
+        // A content mod's own declaration (`container` in the block's file),
+        // unless a native mod answered for the block.
+        if container.is_none()
+            && let Some(declared) = horizon_client::containers::block_container(block)
+        {
+            *container = Some(declared.container.clone());
+        }
     }
     /// Block `block`'s block entity has fluid tanks: set `fluids` when the
     /// block is yours, in the container's shape — each tank's capacity in
@@ -8699,6 +8707,17 @@ impl Game<'_> {
         }
         if let Some(entity) = BlockEntity::for_block(name) {
             return Some(entity);
+        }
+        // A content mod's block that declares a `container`: its block entity
+        // is a mod's of the block's own id, holding the slots.
+        if horizon_client::containers::block_container(name).is_some() {
+            return Some(BlockEntity::Mod(Box::new(
+                ModBlockEntityFields {
+                    id: name.to_owned(),
+                    ..Default::default()
+                }
+                .into(),
+            )));
         }
         let mut entity = None;
         self.native_block_entity(name, &mut entity);

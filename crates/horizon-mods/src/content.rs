@@ -98,6 +98,10 @@ pub struct BlockProperties {
     pub sounds: Option<String>,
     /// Which states tick randomly, whatever the template does (`isRandomlyTicking`).
     pub random_ticks: Option<RandomTicks>,
+    /// `false`: the block never hides its neighbours' faces and lets light
+    /// through as a non-solid block does (`BlockBehaviour.Properties.noOcclusion`),
+    /// whatever its template does. `true` or unset keeps the template's.
+    pub can_occlude: Option<bool>,
 }
 
 /// Which of a block's states get random ticks (`BlockBehaviour.isRandomlyTicking(state)`), so a
@@ -127,12 +131,49 @@ impl RandomTicks {
     }
 }
 
-/// Per-state outline and collision boxes, selected by one state property.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+/// Per-state boxes, selected by one state property (`property`) or by the
+/// values of several (`properties`), the template's or the block's own
+/// (`state_properties`). Exactly one of the two is given.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BlockShapes {
+    /// The property whose value names the entry of `values`; empty when
+    /// `properties` selects instead.
+    #[serde(default)]
     pub property: String,
+    /// The properties whose values together name the entry: its key is
+    /// `name=value` for each, in this order, joined by commas
+    /// (`"facing=north,part=head"`). Listing every property gives a shape per
+    /// state; an empty list one shape for all, under the key `""`.
+    #[serde(default)]
+    pub properties: Option<Vec<String>>,
     pub values: BTreeMap<String, Vec<[f64; 6]>>,
+}
+
+impl BlockShapes {
+    /// The key into `values` of a state whose property values `value` gives,
+    /// or why there is none (a property the state lacks).
+    pub fn key<'a>(&self, value: impl Fn(&str) -> Option<&'a str>) -> Result<String, String> {
+        match &self.properties {
+            None => value(&self.property)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("the state lacks property {}", self.property)),
+            Some(names) => {
+                let mut key = String::new();
+                for (i, name) in names.iter().enumerate() {
+                    let v =
+                        value(name).ok_or_else(|| format!("the state lacks property {name}"))?;
+                    if i > 0 {
+                        key.push(',');
+                    }
+                    key.push_str(name);
+                    key.push('=');
+                    key.push_str(v);
+                }
+                Ok(key)
+            }
+        }
+    }
 }
 
 /// A state property a block declares on its own, beside its template's.
@@ -174,6 +215,8 @@ struct BlockFile {
     properties: BlockProperties,
     shapes: Option<BlockShapes>,
     #[serde(default)]
+    collision: Option<BlockShapes>,
+    #[serde(default)]
     state_properties: BTreeMap<String, StateProperty>,
     #[serde(default)]
     default_state: BTreeMap<String, String>,
@@ -189,9 +232,30 @@ struct BlockFile {
     item: bool,
     #[serde(default)]
     components: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    container: Option<BlockContainer>,
 }
 fn yes() -> bool {
     true
+}
+
+/// The inventory of a block's block entity (`container` in a block's file): a
+/// `BaseContainerBlockEntity` of `slots` stacks that opens `menu` when the
+/// block is used with an empty hand, keeps its items in the chunk, drops them
+/// when the block is broken or replaced and feeds hoppers and comparators, as
+/// a barrel does. The block needs no native mod.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BlockContainer {
+    /// 1 to [`MAX_MENU_SLOTS`]; the menu has as many.
+    pub slots: u16,
+    /// A vanilla menu type with as many slots (`minecraft:generic_9x3`), or one
+    /// of this mod's `menu/` types with as many.
+    pub menu: String,
+    /// The menu's title as a literal; the block's name
+    /// (`block.<id>.<path>`) when unset.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// A block the mod adds: a vanilla template's behaviour, states and shapes
@@ -205,7 +269,12 @@ pub struct Block {
     /// The vanilla block it copies, `minecraft:<path>`.
     pub template: String,
     pub properties: BlockProperties,
+    /// Its outline, and its collision too unless `collision` is set; the
+    /// template's when unset.
     pub shapes: Option<BlockShapes>,
+    /// Its collision boxes when they differ from `shapes` (a hanging shelf
+    /// you can walk through); `shapes`, else the template's, when unset.
+    pub collision: Option<BlockShapes>,
     /// State properties of its own, which its template does not have.
     pub state_properties: BTreeMap<String, StateProperty>,
     /// State properties overlaid on the template default.
@@ -230,6 +299,8 @@ pub struct Block {
     /// template is the matching wall sign and which has no item. The
     /// template's when unset.
     pub wall_block: Option<String>,
+    /// Its block entity's inventory, when it has one.
+    pub container: Option<BlockContainer>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -738,6 +809,7 @@ impl Content {
                 template: file.template,
                 properties: file.properties,
                 shapes: file.shapes,
+                collision: file.collision,
                 state_properties: file.state_properties,
                 default_state: file.default_state,
                 item: file.item,
@@ -748,6 +820,7 @@ impl Content {
                 thickness: file.thickness,
                 wood_type: file.wood_type,
                 wall_block: file.wall_block,
+                container: file.container,
             };
             check_block(&block).map_err(|e| format!("{name}: {e}"))?;
             if block.item {
@@ -914,8 +987,56 @@ impl Content {
             }
             self.menu_types.push(MenuType { id: menu, ..file });
         }
+        // After every menu type, so a container may name one declared later.
+        for block in &self.blocks {
+            if let Some(container) = &block.container {
+                check_container(&block.id, container, &self.menu_types)?;
+            }
+        }
         Ok(())
     }
+}
+
+/// A block's `container`: its slot count and a menu with as many slots.
+fn check_container(
+    block: &str,
+    container: &BlockContainer,
+    menus: &[MenuType],
+) -> Result<(), String> {
+    if !(1..=MAX_MENU_SLOTS).contains(&container.slots) {
+        return Err(format!("{block}: container slots is 1 to {MAX_MENU_SLOTS}"));
+    }
+    if container
+        .title
+        .as_deref()
+        .is_some_and(|t| t.is_empty() || t.len() > 256)
+    {
+        return Err(format!(
+            "{block}: container title is 1 to 256 bytes (leave it out for the block's name)"
+        ));
+    }
+    if let Some(own) = menus.iter().find(|m| m.id == container.menu) {
+        if own.slots != container.slots {
+            return Err(format!(
+                "{block}: menu {} has {} slots, the container {}",
+                own.id, own.slots, container.slots
+            ));
+        }
+        return Ok(());
+    }
+    // A vanilla menu type's slot count is the game's to check (it knows the
+    // menus); here only that the id is vanilla's spelling.
+    if container
+        .menu
+        .strip_prefix("minecraft:")
+        .is_some_and(|p| state_name(p))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "{block}: container menu {:?} is a vanilla menu type (minecraft:generic_9x3...) or one of this mod's menu/ types",
+        container.menu
+    ))
 }
 
 /// Namespaced component types, removals as `{}`, and none of `fields`,
@@ -959,6 +1080,61 @@ fn check_item(item: &Item) -> Result<(), String> {
     check_components(&item.components, &["max_stack_size", "rarity"])
 }
 
+/// A `shapes` or `collision` map: one way of selecting, entries keyed the
+/// way it selects, at most 16 finite boxes with ordered bounds each. Whether
+/// the keys cover the block's states is checked when the game builds them.
+fn check_shapes(shapes: &BlockShapes) -> Result<(), String> {
+    match &shapes.properties {
+        None if shapes.property.is_empty() || shapes.values.is_empty() => {
+            return Err("needs a property and values".into());
+        }
+        None => {}
+        Some(_) if !shapes.property.is_empty() => {
+            return Err("selects by property or by properties, not both".into());
+        }
+        Some(names) => {
+            let mut seen = BTreeSet::new();
+            for name in names {
+                if !state_name(name) || !seen.insert(name.as_str()) {
+                    return Err(format!(
+                        "properties: {name:?} is a state property name, given once"
+                    ));
+                }
+            }
+            if shapes.values.is_empty() {
+                return Err("needs values".into());
+            }
+            for key in shapes.values.keys() {
+                let pairs: Vec<Option<(&str, &str)>> = if key.is_empty() {
+                    Vec::new()
+                } else {
+                    key.split(',').map(|p| p.split_once('=')).collect()
+                };
+                let fits = pairs.len() == names.len()
+                    && pairs
+                        .iter()
+                        .zip(names)
+                        .all(|(pair, name)| pair.is_some_and(|(n, v)| n == name && state_name(v)));
+                if !fits {
+                    return Err(format!(
+                        "key {key:?} is name=value for each of {names:?}, in that order"
+                    ));
+                }
+            }
+        }
+    }
+    for boxes in shapes.values.values() {
+        if boxes.len() > 16
+            || boxes
+                .iter()
+                .any(|b| b.iter().any(|n| !n.is_finite()) || (0..3).any(|i| b[i] > b[i + 3]))
+        {
+            return Err("a shape is at most 16 finite boxes with ordered bounds".into());
+        }
+    }
+    Ok(())
+}
+
 /// A block's fields, as a file or code gives them (`connects_to` without
 /// its `#`).
 fn check_block(file: &Block) -> Result<(), String> {
@@ -968,18 +1144,9 @@ fn check_block(file: &Block) -> Result<(), String> {
             file.template
         ));
     }
-    if let Some(shapes) = &file.shapes {
-        if shapes.property.is_empty() || shapes.values.is_empty() {
-            return Err("shapes needs a property and values".into());
-        }
-        for boxes in shapes.values.values() {
-            if boxes.len() > 16
-                || boxes
-                    .iter()
-                    .any(|b| b.iter().any(|n| !n.is_finite()) || (0..3).any(|i| b[i] > b[i + 3]))
-            {
-                return Err("shape needs at most 16 finite boxes with ordered bounds".into());
-            }
+    for (what, shapes) in [("shapes", &file.shapes), ("collision", &file.collision)] {
+        if let Some(shapes) = shapes {
+            check_shapes(shapes).map_err(|e| format!("{what}: {e}"))?;
         }
     }
     for (name, property) in &file.state_properties {
@@ -1084,7 +1251,7 @@ fn check_block(file: &Block) -> Result<(), String> {
             return Err("thickness is a connecting block's (connects_to)".into());
         }
         Some(t) if !(2.0..=14.0).contains(&t) => return Err("thickness is 2 to 14 pixels".into()),
-        Some(_) if file.shapes.is_some() => {
+        Some(_) if file.shapes.is_some() || file.collision.is_some() => {
             return Err("thickness sets the shapes, so a block has one or the other".into());
         }
         _ => {}
@@ -1287,6 +1454,95 @@ capabilities = ["registries"]
         content.declare(&[cable], &[]).unwrap();
     }
 
+    /// `shapes` and `collision` select boxes by one property or by several,
+    /// each key naming the listed properties' values in order, and
+    /// `can_occlude` is a block property of its own.
+    #[test]
+    fn shapes_select_by_several_properties_and_collision_stands_apart() {
+        let read = |name: &str, json: &str| {
+            let path = format!("data/ruby/horizon/block/{name}.json");
+            hmod(name, MANIFEST_TEXT, &[(path.as_str(), json.as_bytes())])
+        };
+        let ok = read(
+            "by-state",
+            r#"{"template": "minecraft:stone",
+              "state_properties": {"facing": {"type": "enum", "values": ["north", "south"]},
+                                   "lit": {"type": "boolean"}},
+              "properties": {"can_occlude": false},
+              "shapes": {"properties": ["facing", "lit"], "values": {
+                "facing=north,lit=false": [[0, 0, 0, 1, 0.5, 1]],
+                "facing=north,lit=true": [[0, 0, 0, 1, 0.5, 1]],
+                "facing=south,lit=false": [],
+                "facing=south,lit=true": [[0, 0, 0.5, 1, 1, 1], [0, 0, 0, 0.5, 0.5, 0.5]]}},
+              "collision": {"property": "lit", "values": {"false": [], "true": [[0, 0, 0, 1, 1, 1]]}}}"#,
+        )
+        .unwrap();
+        let block = &ok.blocks[0];
+        assert_eq!(block.properties.can_occlude, Some(false));
+        let shapes = block.shapes.as_ref().unwrap();
+        let state = [("facing", "south"), ("lit", "true")];
+        let value = |name: &str| state.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+        let key = shapes.key(value).unwrap();
+        assert_eq!(key, "facing=south,lit=true");
+        assert_eq!(shapes.values[&key].len(), 2);
+        let collision = block.collision.as_ref().unwrap();
+        assert_eq!(collision.key(value).unwrap(), "true");
+        assert!(shapes.key(|_| None).unwrap_err().contains("facing"));
+        // One shape for every state: no properties, the key "".
+        let all = read(
+            "one-shape",
+            r#"{"template": "minecraft:stone", "shapes": {"properties": [], "values": {"": [[0, 0, 0, 1, 0.25, 1]]}}}"#,
+        )
+        .unwrap();
+        let shapes = all.blocks[0].shapes.as_ref().unwrap();
+        assert_eq!(shapes.key(|_| None).unwrap(), "");
+
+        for (name, json, wanted) in [
+            (
+                "both-ways",
+                r#"{"template": "minecraft:stone", "shapes": {"property": "lit", "properties": ["lit"], "values": {"lit=true": []}}}"#,
+                "not both",
+            ),
+            (
+                "out-of-order",
+                r#"{"template": "minecraft:stone", "shapes": {"properties": ["facing", "lit"], "values": {"lit=true,facing=north": []}}}"#,
+                "in that order",
+            ),
+            (
+                "short-key",
+                r#"{"template": "minecraft:stone", "shapes": {"properties": ["facing", "lit"], "values": {"facing=north": []}}}"#,
+                "in that order",
+            ),
+            (
+                "repeated",
+                r#"{"template": "minecraft:stone", "shapes": {"properties": ["lit", "lit"], "values": {"lit=true,lit=true": []}}}"#,
+                "given once",
+            ),
+            (
+                "collision-reversed",
+                r#"{"template": "minecraft:stone", "collision": {"property": "axis", "values": {"x": [[1, 0, 0, 0, 1, 1]]}}}"#,
+                "collision: a shape is at most 16",
+            ),
+            (
+                "seventeen",
+                &format!(
+                    r#"{{"template": "minecraft:stone", "shapes": {{"properties": [], "values": {{"": [{}]}}}}}}"#,
+                    vec!["[0, 0, 0, 1, 1, 1]"; 17].join(",")
+                ),
+                "at most 16",
+            ),
+            (
+                "pipe-collision",
+                r##"{"template": "minecraft:chorus_plant", "connects_to": "#ruby:j", "thickness": 4,
+                    "collision": {"properties": [], "values": {"": []}}}"##,
+                "one or the other",
+            ),
+        ] {
+            let e = read(name, json).unwrap_err();
+            assert!(e.contains(wanted), "{name}: {e}");
+        }
+    }
+
     #[test]
     fn a_connecting_block_file_names_its_tag_with_a_hash() {
         let cable = br#"{"template": "minecraft:chorus_plant", "connects_to": "ruby:cables"}"#;
@@ -1330,6 +1586,7 @@ capabilities = ["registries"]
                 id: "ruby:ruby_block".into(),
                 template: "minecraft:iron_block".into(),
                 shapes: None,
+                collision: None,
                 state_properties: BTreeMap::new(),
                 default_state: BTreeMap::new(),
                 properties: BlockProperties {
@@ -1344,6 +1601,7 @@ capabilities = ["registries"]
                 thickness: None,
                 wood_type: None,
                 wall_block: None,
+                container: None,
             }]
         );
         assert_eq!(content.items[0].id, "ruby:ruby");
@@ -1522,6 +1780,93 @@ capabilities = ["registries"]
             let e = hmod(case, MANIFEST_TEXT, files).unwrap_err();
             assert!(e.contains(why), "{case}: {e}");
         }
+    }
+
+    #[test]
+    fn a_block_declares_its_container_and_the_menu_it_opens() {
+        let block = |container: &str| {
+            format!(r#"{{"template": "minecraft:stone", "container": {container}}}"#)
+        };
+        let ok = block(r#"{"slots": 27, "menu": "minecraft:generic_9x3", "title": "Storage"}"#);
+        let own = block(r#"{"slots": 4, "menu": "ruby:bag"}"#);
+        let files: &[(&str, &[u8])] = &[
+            ("data/ruby/horizon/block/chest.json", ok.as_bytes()),
+            ("data/ruby/horizon/block/bag.json", own.as_bytes()),
+            ("data/ruby/horizon/menu/bag.json", br#"{"slots": 4}"#),
+        ];
+        let content = hmod("container-ok", MANIFEST_TEXT, files).unwrap();
+        let containers: Vec<_> = content
+            .blocks
+            .iter()
+            .map(|b| (b.id.as_str(), b.container.clone().unwrap()))
+            .collect();
+        assert_eq!(
+            containers,
+            [
+                (
+                    "ruby:bag",
+                    BlockContainer {
+                        slots: 4,
+                        menu: "ruby:bag".into(),
+                        title: None
+                    }
+                ),
+                (
+                    "ruby:chest",
+                    BlockContainer {
+                        slots: 27,
+                        menu: "minecraft:generic_9x3".into(),
+                        title: Some("Storage".into())
+                    }
+                ),
+            ]
+        );
+        for (case, container, why) in [
+            (
+                "c-none",
+                r#"{"slots": 0, "menu": "minecraft:hopper"}"#,
+                "slots is 1 to 256",
+            ),
+            (
+                "c-big",
+                r#"{"slots": 257, "menu": "minecraft:hopper"}"#,
+                "slots is 1 to 256",
+            ),
+            (
+                "c-menu",
+                r#"{"slots": 5, "menu": "hopper"}"#,
+                "vanilla menu type",
+            ),
+            (
+                "c-other",
+                r#"{"slots": 5, "menu": "other:bag"}"#,
+                "vanilla menu type",
+            ),
+            (
+                "c-title",
+                r#"{"slots": 5, "menu": "minecraft:hopper", "title": ""}"#,
+                "title is 1 to 256",
+            ),
+            (
+                "c-key",
+                r#"{"slots": 5, "menu": "minecraft:hopper", "faces": 1}"#,
+                "unknown field",
+            ),
+            ("c-missing", r#"{"slots": 5}"#, "missing field"),
+        ] {
+            let file = block(container);
+            let files: &[(&str, &[u8])] = &[("data/ruby/horizon/block/c.json", file.as_bytes())];
+            let e = hmod(case, MANIFEST_TEXT, files).unwrap_err();
+            assert!(e.contains(why), "{case}: {e}");
+        }
+        // A mod's own menu must hold as many slots as the container.
+        let wrong = block(r#"{"slots": 9, "menu": "ruby:bag"}"#);
+        let files: &[(&str, &[u8])] = &[
+            ("data/ruby/horizon/block/c.json", wrong.as_bytes()),
+            ("data/ruby/horizon/menu/bag.json", br#"{"slots": 4}"#),
+        ];
+        let e = hmod("c-slots", MANIFEST_TEXT, files).unwrap_err();
+        assert!(e.contains("has 4 slots, the container 9"), "{e}");
     }
 
     #[test]

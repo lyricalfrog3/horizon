@@ -307,6 +307,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             match class {
                 Class::AbstractFurnace
                 | Class::Barrel
+                | Class::ModContainer
                 | Class::BrewingStand
                 | Class::Chest
                 | Class::ChiseledBookShelf

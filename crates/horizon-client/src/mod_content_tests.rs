@@ -1571,6 +1571,50 @@ fn content_root_registers_a_mod_menu_type() {
     fs::remove_dir_all(&scratch).unwrap();
 }
 
+/// A block that declares a `container` is the world's container class (a use
+/// opens its menu), and the game gets its slots and menu; a block of the same
+/// template without one is not.
+#[test]
+#[ignore = "full content root: CI and pr_ready run it"]
+fn content_root_makes_a_declared_container_open_its_menu() {
+    let Some(base) = prepared() else {
+        return;
+    };
+    let scratch =
+        std::env::temp_dir().join(format!("horizon-mod-container-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let m = folder_mod(
+        &scratch.join("example"),
+        &[
+            ("horizon-mod.toml", &manifest("example", "")),
+            (
+                "data/example/horizon/block/crate.json",
+                r#"{"template": "minecraft:stone",
+                    "container": {"slots": 27, "menu": "minecraft:generic_9x3", "title": "Crate"}}"#,
+            ),
+            (
+                "data/example/horizon/block/plain.json",
+                r#"{"template": "minecraft:stone"}"#,
+            ),
+        ],
+    );
+    let blocks = block_containers(std::slice::from_ref(&m));
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].0, "example:crate");
+    let root = resource_root(&base, std::slice::from_ref(&m), &scratch.join("cache")).unwrap();
+    let assets = Assets::load(&root).unwrap();
+    let behaviours = horizon_world::level::Behaviours::load(assets.registry, &root).unwrap();
+    use horizon_world::level::classes::Class;
+    let class = |name: &str| {
+        let state = assets.registry.default_state(name).unwrap();
+        behaviours.data(state).chain.first().copied()
+    };
+    assert_eq!(class("example:crate"), Some(Class::ModContainer));
+    assert_ne!(class("example:plain"), Some(Class::ModContainer));
+    assert_ne!(class("minecraft:stone"), Some(Class::ModContainer));
+    fs::remove_dir_all(&scratch).unwrap();
+}
+
 /// A content mod folder from `(path, text)` pairs, read as the game reads it.
 fn folder_mod(dir: &Path, files: &[(&str, &str)]) -> ContentMod {
     for (name, text) in files {
@@ -4053,4 +4097,269 @@ fn declarations_in_a_listed_namespace_join_the_owning_mod() {
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(mods.len(), 1);
     assert_eq!(mods[0].content.blocks[0].id, "ruby-gems:ore");
+}
+
+/// The added rows of `table` (after the base's `count`), each with the
+/// properties `facts.json`'s matching row carries.
+fn added_rows(
+    plan: &Plan,
+    base: &Path,
+    table: &str,
+    count: usize,
+) -> Vec<(BTreeMap<String, String>, J)> {
+    let read = |name: &str| -> J {
+        let mut doc: J =
+            serde_json::from_str(&fs::read_to_string(base.join(name)).unwrap()).unwrap();
+        plan.json(name, &mut doc).unwrap();
+        doc
+    };
+    let facts = read("facts.json");
+    let rows = read(table);
+    let (Some(J::Arr(facts)), Some(J::Arr(rows))) = (facts.get("states"), rows.get("states"))
+    else {
+        panic!("no states")
+    };
+    facts[count..]
+        .iter()
+        .zip(&rows[count..])
+        .map(|(f, row)| {
+            let J::Arr(f) = f else {
+                panic!("a facts row is not a list")
+            };
+            let props = match f.get(4).and_then(|p| p.get("properties")) {
+                Some(J::Obj(p)) => p
+                    .iter()
+                    .map(|(k, v)| match v {
+                        J::Str(v) => (k.clone(), v.clone()),
+                        _ => panic!("a property value is not a string"),
+                    })
+                    .collect(),
+                _ => BTreeMap::new(),
+            };
+            (props, row.clone())
+        })
+        .collect()
+}
+
+fn outline_of(row: &J) -> Vec<Vec<f64>> {
+    let Some(J::Arr(boxes)) = row.get("outline") else {
+        panic!("no outline")
+    };
+    boxes
+        .iter()
+        .map(|b| match b {
+            J::Arr(n) => n.iter().map(|x| x.as_f64().unwrap()).collect(),
+            _ => panic!("a box is not a list"),
+        })
+        .collect()
+}
+
+/// `shapes` can select by the template's property and the block's own
+/// together (one shape per full state), and `collision` by the block's own
+/// alone: each state of the fan-out gets the boxes its values name, in the
+/// gameplay rows and in the collision table alike.
+#[test]
+fn shapes_follow_every_property_of_a_state() {
+    let declaration = r#"{"template":"minecraft:test","item":false,
+      "state_properties":{"lit":{"type":"boolean"}},
+      "shapes":{"properties":["axis","lit"],"values":{
+        "axis=x,lit=false":[[0,0,0,1,0.25,1]],
+        "axis=x,lit=true":[[0,0,0,1,0.5,1]],
+        "axis=y,lit=false":[[0,0,0,0.5,1,1]],
+        "axis=y,lit=true":[[0,0,0,1,0.25,1]]}},
+      "collision":{"property":"lit","values":{"false":[],"true":[[0,0,0,1,1,1]]}}}"#;
+    let (base, mods) = block_base("block-shape-states", &[declaration]);
+    let plan = Plan::new(&base, &mods).unwrap();
+    let rows = added_rows(&plan, &base, "gameplay-facts.json", 2);
+    assert_eq!(rows.len(), 4);
+    let expect = |axis: &str, lit: &str| -> (Vec<f64>, bool) {
+        match (axis, lit) {
+            ("x", "false") => (vec![0., 0., 0., 1., 0.25, 1.], false),
+            ("x", "true") => (vec![0., 0., 0., 1., 0.5, 1.], true),
+            ("y", "false") => (vec![0., 0., 0., 0.5, 1., 1.], false),
+            _ => (vec![0., 0., 0., 1., 0.25, 1.], true),
+        }
+    };
+    for (props, row) in &rows {
+        let (outline, full) = expect(&props["axis"], &props["lit"]);
+        assert_eq!(outline_of(row), vec![outline], "{props:?}");
+        assert_eq!(row.get("full_collision"), Some(&J::Bool(full)), "{props:?}");
+    }
+    // The collision table: two distinct shapes (empty and the full block),
+    // each state pointing at the one its `lit` names.
+    let mut tag = Tag::Compound(Compound::from([
+        (
+            JavaString::from("states"),
+            Tag::List(vec![test_state_row("x"), test_state_row("y")]),
+        ),
+        (JavaString::from("shapes"), Tag::List(Vec::new())),
+        (
+            JavaString::from("cached_shapes"),
+            Tag::IntArray(vec![-1, -1]),
+        ),
+    ]));
+    plan.nbt(&mut tag);
+    plan.collision_shapes(&mut tag).unwrap();
+    let (Some(Tag::List(entries)), Some(Tag::IntArray(mapping)), Some(Tag::List(states))) = (
+        tag.get("shapes"),
+        tag.get("cached_shapes"),
+        tag.get("states"),
+    ) else {
+        panic!("collision table")
+    };
+    assert_eq!(entries.len(), 2);
+    let mut by_lit = BTreeMap::new();
+    for (i, state) in states.iter().enumerate().skip(2) {
+        let Some(Tag::Compound(p)) = state.get("properties") else {
+            panic!("row {i} has no properties")
+        };
+        let Some(Tag::String(lit)) = p.get(&JavaString::from("lit")) else {
+            panic!("row {i} has no lit")
+        };
+        let shape = by_lit.entry(lit.to_string_lossy()).or_insert(mapping[i]);
+        assert_eq!(*shape, mapping[i], "row {i}");
+    }
+    assert_eq!(by_lit.len(), 2);
+    assert_ne!(by_lit["false"], by_lit["true"]);
+    fs::remove_dir_all(base.parent().unwrap()).ok();
+}
+
+/// A shape map that misses a state, or names a value no state has, is refused.
+#[test]
+fn shapes_by_properties_cover_exactly_the_states() {
+    for (shapes, wanted) in [
+        (
+            r#"{"properties":["axis","lit"],"values":{"axis=x,lit=false":[],"axis=x,lit=true":[],"axis=y,lit=false":[]}}"#,
+            "no shape for axis=y,lit=true",
+        ),
+        (
+            r#"{"property":"lit","values":{"false":[],"true":[],"maybe":[]}}"#,
+            "name no state",
+        ),
+    ] {
+        let declaration = format!(
+            r#"{{"template":"minecraft:test","item":false,
+              "state_properties":{{"lit":{{"type":"boolean"}}}},"shapes":{shapes}}}"#
+        );
+        let (base, mods) = block_base("block-shape-cover", &[&declaration]);
+        let e = Plan::new(&base, &mods).err().unwrap().to_string();
+        assert!(e.contains(wanted), "{e}");
+        fs::remove_dir_all(base.parent().unwrap()).ok();
+    }
+}
+
+/// `can_occlude: false` on an occluding full-cube template: no state occludes,
+/// is solid or hides a neighbour's face, and light passes as through a
+/// non-solid full block (dampening 1). With its own half-height outline the
+/// block lets skylight down (dampening 0); one that still occludes has its
+/// outline as its occlusion shape.
+#[test]
+fn a_block_that_does_not_occlude_says_so_in_every_table() {
+    let open = r#"{"template":"minecraft:test","item":false,"properties":{"can_occlude":false}}"#;
+    let low = r#"{"template":"minecraft:test","item":false,
+      "shapes":{"properties":[],"values":{"":[[0,0,0,1,0.5,1]]}}}"#;
+    let (base, mut mods) = block_base("block-occlusion", &[open]);
+    let (_, more) = block_base_of(
+        "block-occlusion-low",
+        &[low],
+        &fs::read_to_string(base.join("facts.json")).unwrap(),
+    );
+    let mut low_mod = more.into_iter().next().unwrap();
+    low_mod.id = "zmod".into();
+    for b in &mut low_mod.content.blocks {
+        b.id = "testmod:low".into();
+    }
+    mods.push(low_mod);
+    let solid = r#"{"item":"minecraft:test","can_occlude":true,"solid_render":true,"dampening":15,
+      "skylight_down":false,"liquid":false,"outline":[[0.0,0.0,0.0,1.0,1.0,1.0]]}"#;
+    fs::write(
+        base.join("gameplay-facts.json"),
+        format!(r#"{{"states":[{solid},{solid}]}}"#),
+    )
+    .unwrap();
+    let plan = Plan::new(&base, &mods).unwrap();
+    let ids: Vec<&str> = plan.blocks.iter().map(|b| b.decl.id.as_str()).collect();
+    assert_eq!(ids, ["testmod:test", "testmod:low"]);
+    let rows = added_rows(&plan, &base, "gameplay-facts.json", 2);
+    assert_eq!(rows.len(), 4);
+    for (i, (_, row)) in rows.iter().enumerate() {
+        let open = i < 2;
+        assert_eq!(row.get("can_occlude"), Some(&J::Bool(!open)), "row {i}");
+        assert_eq!(row.get("solid_render"), Some(&J::Bool(false)), "row {i}");
+        assert_eq!(row.get("skylight_down"), Some(&J::Bool(!open)), "row {i}");
+        let dampening = if open { 1 } else { 0 };
+        assert_eq!(
+            row.get("dampening"),
+            Some(&J::Num(dampening.into())),
+            "row {i}"
+        );
+    }
+    // Neighbour faces: the renderer's definition says the open block never occludes.
+    let mut defs: J = serde_json::from_str(
+        r#"{"minecraft:test":{"states":[0,1],"rule":"never","bars_tag":false,"can_occlude":true,"default":0}}"#,
+    )
+    .unwrap();
+    plan.json("render-definitions.json", &mut defs).unwrap();
+    let occludes = |id: &str| defs.get(id).and_then(|d| d.get("can_occlude")).cloned();
+    assert_eq!(occludes("testmod:test"), Some(J::Bool(false)));
+    assert_eq!(occludes("testmod:low"), Some(J::Bool(true)));
+    // The occlusion tables: the open block's states take an empty shape, the
+    // low block's its half-height outline; block-properties.nbt's flags lose
+    // `canOcclude` (16) for the open block only.
+    let table = || {
+        Tag::Compound(Compound::from([
+            (
+                JavaString::from("states"),
+                Tag::List(vec![test_state_row("x"), test_state_row("y")]),
+            ),
+            (JavaString::from("shapes"), Tag::List(Vec::new())),
+            (
+                JavaString::from("cached_shapes"),
+                Tag::IntArray(vec![-1, -1]),
+            ),
+        ]))
+    };
+    let mut tag = Tag::Compound(Compound::from([
+        (
+            JavaString::from("blocks"),
+            Tag::Compound(Compound::from([(
+                JavaString::from("minecraft:test"),
+                Tag::Byte(16 | 4),
+            )])),
+        ),
+        (JavaString::from("occlusion"), table()),
+    ]));
+    plan.nbt(&mut tag);
+    plan.occlusion_shapes(&mut tag).unwrap();
+    let Some(Tag::Compound(blocks)) = tag.get("blocks") else {
+        panic!("no blocks")
+    };
+    assert_eq!(
+        blocks.get(&JavaString::from("testmod:test")),
+        Some(&Tag::Byte(4))
+    );
+    assert_eq!(
+        blocks.get(&JavaString::from("testmod:low")),
+        Some(&Tag::Byte(16 | 4))
+    );
+    let Some(Tag::Compound(occlusion)) = tag.get("occlusion") else {
+        panic!("no occlusion")
+    };
+    let (Some(Tag::List(entries)), Some(Tag::IntArray(mapping))) = (
+        occlusion.get(&JavaString::from("shapes")),
+        occlusion.get(&JavaString::from("cached_shapes")),
+    ) else {
+        panic!("occlusion table")
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[mapping[2] as usize],
+        encode_shape(&VoxelShape::empty())
+    );
+    assert_eq!(mapping[2], mapping[3]);
+    let half =
+        VoxelShape::from_box(Aabb::new(Vec3::new(0., 0., 0.), Vec3::new(1., 0.5, 1.))).unwrap();
+    assert_eq!(entries[mapping[4] as usize], encode_shape(&half));
+    assert_eq!(mapping[4], mapping[5]);
+    fs::remove_dir_all(base.parent().unwrap()).ok();
 }

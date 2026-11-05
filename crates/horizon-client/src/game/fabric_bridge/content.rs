@@ -12,8 +12,19 @@
 //! Where the mod puts its items in creative tabs (Fabric's
 //! `CreativeModeTabEvents.modifyOutputEvent`) becomes the mod's
 //! `tab_entries` file per tab.
+//!
+//! The blocks a mod registers in code become block declarations in the same
+//! content mod, each over the vanilla template its facts call for
+//! ([`blocks`]), with its own outline and collision per state; the jar's
+//! blockstates, models and loot tables come along with its assets and data.
+//! Its `BlockItem` is the block's item. Block entities and the block class's
+//! own code are not reproduced.
 
-use hfc_runtime::bridge::{CreativeTabAddition, FabricModMetadata, RegisteredItem, TabPlacement};
+mod blocks;
+
+use hfc_runtime::bridge::{
+    CreativeTabAddition, FabricModMetadata, RegisteredBlock, RegisteredItem, TabPlacement,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -22,27 +33,47 @@ use std::path::{Path, PathBuf};
 const MAX_COPY: u64 = 256 << 20;
 
 /// Writes the generated content mods under `out` and returns their folders.
-pub(in super::super) fn fabric_content_mods(out: &Path) -> Vec<PathBuf> {
-    let (items, tabs, mods) = match super::get_fabric_bridge().lock() {
-        Ok(bridge) => (
-            bridge.registered_items(),
-            bridge.creative_tab_additions(),
-            bridge.loaded_mods().to_vec(),
-        ),
+/// `base` is the prepared resource root, whose vanilla block tables the
+/// blocks' templates are chosen from.
+pub(in super::super) fn fabric_content_mods(out: &Path, base: &Path) -> Vec<PathBuf> {
+    let (items, blocks, tabs, mods) = match super::get_fabric_bridge().lock() {
+        Ok(mut bridge) => {
+            let blocks = registered_blocks(&mut bridge);
+            (
+                bridge.registered_items(),
+                blocks,
+                bridge.creative_tab_additions(),
+                bridge.loaded_mods().to_vec(),
+            )
+        }
         Err(_) => return Vec::new(),
     };
     let _ = std::fs::remove_dir_all(out);
-    let mut by_namespace: BTreeMap<String, Vec<RegisteredItem>> = BTreeMap::new();
+    let declared = declare_blocks(&blocks, base);
+    let mut by_namespace: BTreeMap<
+        String,
+        (Vec<RegisteredItem>, Vec<(String, serde_json::Value)>),
+    > = BTreeMap::new();
     for item in items {
         if let Some((namespace, _)) = item.id.split_once(':') {
             by_namespace
                 .entry(namespace.to_owned())
                 .or_default()
+                .0
                 .push(item);
         }
     }
+    for (id, json) in declared {
+        if let Some((namespace, _)) = id.split_once(':') {
+            by_namespace
+                .entry(namespace.to_owned())
+                .or_default()
+                .1
+                .push((id, json));
+        }
+    }
     let mut folders = Vec::new();
-    for (namespace, items) in by_namespace {
+    for (namespace, (items, blocks)) in by_namespace {
         // The tab placements of this namespace's items, in the mod's order.
         let tabs: Vec<&CreativeTabAddition> = tabs
             .iter()
@@ -52,19 +83,84 @@ pub(in super::super) fn fabric_content_mods(out: &Path) -> Vec<PathBuf> {
                     .is_some_and(|(ns, _)| ns == namespace)
             })
             .collect();
-        match write_mod(out, &namespace, &items, &tabs, &mods) {
+        match write_mod(out, &namespace, &items, &blocks, &tabs, &mods) {
             Ok(folder) => {
                 log::info!(
-                    "Fabric: {} item(s) registered in {namespace}: content mod {}",
+                    "Fabric: {} item(s) and {} block(s) registered in {namespace}: content mod {}",
                     items.len(),
+                    blocks.len(),
                     folder.display()
                 );
                 folders.push(folder);
             }
-            Err(e) => log::warn!("Fabric: items of {namespace} not loaded: {e}"),
+            Err(e) => log::warn!("Fabric: items and blocks of {namespace} not loaded: {e}"),
         }
     }
     folders
+}
+
+/// The registered blocks, with their shapes. Shapes cost Minecraft's own
+/// `VoxelShape` bytecode (seconds for a big mod), so they are read once per
+/// run, here, on the thread that builds the content root.
+fn registered_blocks(bridge: &mut hfc_runtime::bridge::FabricBridge) -> Vec<RegisteredBlock> {
+    static SHAPES_READ: std::sync::Once = std::sync::Once::new();
+    let mut blocks = bridge.registered_blocks();
+    if blocks.is_empty() {
+        return blocks;
+    }
+    SHAPES_READ.call_once(|| {
+        let started = std::time::Instant::now();
+        bridge.read_block_shapes(&[]);
+        log::info!(
+            "Fabric: shapes of {} registered block(s) read in {:.1?}",
+            blocks.len(),
+            started.elapsed()
+        );
+    });
+    blocks = bridge.registered_blocks();
+    blocks
+}
+
+/// Each block's declaration, by id; the ones left out are logged with why,
+/// and what a declaration leaves out of a block goes to the debug log.
+fn declare_blocks(blocks: &[RegisteredBlock], base: &Path) -> Vec<(String, serde_json::Value)> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let started = std::time::Instant::now();
+    let vanilla = match blocks::Vanilla::load(base) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "Fabric: {} registered block(s) not loaded: vanilla block tables: {e}",
+                blocks.len()
+            );
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    let mut templates: BTreeMap<String, usize> = BTreeMap::new();
+    for block in blocks {
+        match blocks::declare(block, &vanilla) {
+            Ok(declared) => {
+                if let Some(t) = declared.json.get("template").and_then(|t| t.as_str()) {
+                    *templates.entry(t.to_owned()).or_default() += 1;
+                }
+                for note in &declared.notes {
+                    log::debug!("Fabric: block {}: {note}", block.id);
+                }
+                out.push((block.id.clone(), declared.json));
+            }
+            Err(e) => log::warn!("Fabric: block {} left out: {e}", block.id),
+        }
+    }
+    log::info!(
+        "Fabric: {} of {} registered block(s) declared in {:.1?}, templates {templates:?}",
+        out.len(),
+        blocks.len(),
+        started.elapsed()
+    );
+    out
 }
 
 /// A Horizon mod id (`[a-z0-9_]`, at most 64) for a resource namespace,
@@ -192,6 +288,7 @@ fn write_mod(
     out: &Path,
     namespace: &str,
     items: &[RegisteredItem],
+    blocks: &[(String, serde_json::Value)],
     tabs: &[&CreativeTabAddition],
     mods: &[FabricModMetadata],
 ) -> Result<PathBuf, String> {
@@ -206,7 +303,7 @@ fn write_mod(
         quote(&owner.name),
         quote(&owner.version),
         quote(&format!(
-            "Items the Fabric mod {} registers in code",
+            "Blocks and items the Fabric mod {} registers in code",
             owner.id
         )),
     );
@@ -228,6 +325,12 @@ fn write_mod(
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().map_err(|e| e.to_string())?.into_owned();
         if entry.is_dir() || !carried(&name, namespace, &referenced) || name.contains("..") {
+            continue;
+        }
+        // A name that is no resource location (`(`, spaces, capitals) is a file
+        // Minecraft never loads either; the content fence would refuse the mod.
+        if let Err(e) = horizon_mods::content::check_path(&name) {
+            log::warn!("Fabric: {jar}: {e}; not carried");
             continue;
         }
         copied += entry.size();
@@ -269,6 +372,17 @@ fn write_mod(
         }
         let text = serde_json::to_vec_pretty(&serde_json::Value::Object(file))
             .map_err(|e| e.to_string())?;
+        std::fs::write(&target, text).map_err(|e| e.to_string())?;
+    }
+    for (id, json) in blocks {
+        let Some((_, path)) = id.split_once(':') else {
+            continue;
+        };
+        let target = folder.join(format!("data/{namespace}/horizon/block/{path}.json"));
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let text = serde_json::to_vec_pretty(json).map_err(|e| e.to_string())?;
         std::fs::write(&target, text).map_err(|e| e.to_string())?;
     }
     // One `tab_entries` file per tab, entries in the order the mod made them.

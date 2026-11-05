@@ -79,10 +79,11 @@ pub(super) fn content_root(
     let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
     paths.retain(|p| !dev.contains(p));
     paths.extend(dev.iter().cloned());
-    // The items Fabric mods registered in code, as content mods of their own
+    // The items and blocks Fabric mods registered in code, as content mods of their own
     // (rebuilt each start). They are on while their Fabric mod is loaded.
     let fabric = super::fabric_bridge::fabric_content_mods(
         &here.join(".horizon-cache").join("fabric-content"),
+        root,
     );
     paths.extend(fabric.iter().cloned());
     let mut known = None;
@@ -171,6 +172,7 @@ pub(super) fn content_root(
             register_mob_effects(&mods);
             register_entity_types(&mods);
             register_menu_types(&mods);
+            register_block_containers(&mods);
             out
         }
         Err(e) => {
@@ -178,6 +180,7 @@ pub(super) fn content_root(
             register_mob_effects(&[]);
             register_entity_types(&[]);
             register_menu_types(&[]);
+            register_block_containers(&[]);
             root.to_owned()
         }
     }
@@ -274,6 +277,40 @@ fn register_menu_types(mods: &[horizon_client::mod_content::ContentMod]) {
             .ne(menus.iter().map(|m| m.id.as_str()))
     {
         log::warn!("Horizon: the mods' menu types changed; restart the game to use them");
+    }
+}
+
+/// the mods' block containers: set once, from the startup root.
+fn register_block_containers(mods: &[horizon_client::mod_content::ContentMod]) {
+    use horizon_client::containers;
+    let blocks = horizon_client::mod_content::block_containers(mods);
+    for (id, c) in &blocks {
+        let slots = usize::from(c.slots);
+        let shown = containers::MOD_MENUS
+            .iter()
+            .any(|(menu, n)| *menu == c.menu && *n == slots)
+            || containers::mod_menu_type(&c.menu).is_some_and(|m| m.slots == slots);
+        if !shown {
+            log::warn!(
+                "Horizon: {id}: no menu {} with {slots} slots; its container opens nothing",
+                c.menu
+            );
+        }
+    }
+    let set = containers::register_block_containers(blocks.iter().map(|(id, c)| {
+        (
+            (*id).to_owned(),
+            usize::from(c.slots),
+            c.menu.clone(),
+            c.title.clone(),
+        )
+    }));
+    if !set
+        && blocks
+            .iter()
+            .any(|(id, _)| containers::block_container(id).is_none())
+    {
+        log::warn!("Horizon: the mods' block containers changed; restart the game to use them");
     }
 }
 

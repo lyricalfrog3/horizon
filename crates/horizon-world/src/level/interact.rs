@@ -412,6 +412,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 Class::AbstractFurnace
                 | Class::Anvil
                 | Class::Barrel
+                | Class::ModContainer
                 | Class::Beacon
                 | Class::BrewingStand
                 | Class::CartographyTable

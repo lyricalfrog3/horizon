@@ -290,6 +290,10 @@ classes! {
     Honey = "HoneyBlock",
     Slime = "SlimeBlock",
     HeavyCore = "HeavyCoreBlock",
+    // Not a Java class: a content mod's block that declares a `container`
+    // (`mod_content` puts it first in the block's class chain), which opens
+    // its menu when used.
+    ModContainer = "HorizonContainerBlock",
     CryingObsidian = "CryingObsidianBlock",
 }
 

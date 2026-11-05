@@ -1298,7 +1298,13 @@ impl LevelAccess for GameLevel<'_> {
         if self.native_authoritative {
             self.native_has_analog_output(state, &mut output);
         }
+        // A content mod's `container` reads as a barrel does
+        // (`AbstractContainerMenu.getRedstoneSignalFromContainer`).
         output
+            || self
+                .registry
+                .state(state)
+                .is_some_and(|s| horizon_client::containers::block_container(&s.name).is_some())
     }
     fn adjust_analog_output(
         &self,
@@ -6583,6 +6589,7 @@ impl Game<'_> {
         self.award_stat("used", &stack.item, 1);
         self.trigger_block("minecraft:placed_block", target, &stack);
         self.native_place_block(&stack, target, state);
+        self.fabric_block_placed(&ctx, target, state);
         self.check_wither_spawn(target)?;
         self.check_golem_spawn(target)?;
         self.consume_held();
@@ -8117,7 +8124,12 @@ impl Game<'_> {
                     fabric_bridge::apply_fabric_host_requests(&mut self.clipboard);
                     let draws =
                         fabric_bridge::fabric_screen_draws(batch.width as i32, batch.height as i32);
-                    fabric_bridge::replay_fabric_draws(&mut batch, &self.gui.atlas, draws, Some(self));
+                    fabric_bridge::replay_fabric_draws(
+                        &mut batch,
+                        &self.gui.atlas,
+                        draws,
+                        Some(self),
+                    );
                     self.draw_toasts(&mut batch, false);
                     self.draw_tutorial_toasts(&mut batch, false);
                     self.draw_pack_toasts(&mut batch, false);
@@ -17479,14 +17491,15 @@ impl Game<'_> {
                     let b = HudBatch::new(size);
                     if self.title.as_ref().is_some_and(|t| t.on_main_menu())
                         && fabric_bridge::menu_widget_press(
-                        hfc_runtime::minecraft::MenuKind::Title,
-                        0,
-                        b.width,
-                        b.height,
-                        self.cursor,
-                        1,
-                        true,
-                    ) {
+                            hfc_runtime::minecraft::MenuKind::Title,
+                            0,
+                            b.width,
+                            b.height,
+                            self.cursor,
+                            1,
+                            true,
+                        )
+                    {
                         if fabric_bridge::fabric_screen_open() {
                             self.title_fabric = true;
                         }

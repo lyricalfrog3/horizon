@@ -219,7 +219,8 @@ properties and shapes the new block takes, and overrides what differs:
 ```
 
 A block may define `shapes` to replace both its selection outline and collision
-shape. It selects a list of boxes by one template state property:
+shape. It selects a list of boxes by one state property, the template's or one the block
+declares in `state_properties`:
 
 ```json
 "shapes": { "property": "axis", "values": {
@@ -229,11 +230,34 @@ shape. It selects a list of boxes by one template state property:
 } }
 ```
 
-Each box is `[min_x, min_y, min_z, max_x, max_y, max_z]` in block units.
-Each value of the template property needs an entry. Up to 16 boxes form a union;
-an empty list is an empty shape. Invalid bounds or values reject the content root.
-Without `shapes`, both shapes remain the template's. Other properties such as
-occlusion, light, and support still come from the template.
+or by the values of several, `properties`, each key giving `name=value` for every listed property, in the
+listed order, joined by commas. Listing all of a block's properties gives each state a shape of its own;
+an empty list gives every state the one shape under the key `""`:
+
+```json
+"shapes": { "properties": ["facing", "lit"], "values": {
+  "facing=north,lit=false": [[0, 0, 0.3125, 1, 1, 1]],
+  "facing=north,lit=true":  [[0, 0, 0.3125, 1, 1, 1], [0.25, 1, 0.5, 0.75, 1.5, 1]],
+  ...
+} }
+```
+
+Each box is `[min_x, min_y, min_z, max_x, max_y, max_z]` in block units; a box may reach past the block
+(vanilla's do, up to a fence's 1.5). Every state needs an entry and every entry must name a state, or the
+content root is rejected. Up to 16 boxes form a union; an empty list is an empty shape. Invalid bounds or
+keys reject the mod.
+
+`collision` takes the same two forms and replaces only the collision shape, so a block you can walk
+through keeps an outline to aim at (`"collision": {"properties": [], "values": {"": []}}`). Without it
+the collision is `shapes`, and without either both shapes remain the template's.
+
+A block with `shapes` of its own also hides its neighbours' faces and passes light by them, as vanilla's
+default `getOcclusionShape` does: an occluding state's occlusion shape is its outline, it is solid only
+when that is a full block, and light passes down unless it is (`propagatesSkylightDown`,
+`getLightDampening`). `"properties": {"can_occlude": false}` is `BlockBehaviour.Properties.noOcclusion`:
+the block never hides a neighbour's face and is never solid, whatever its template does, which a
+decoration that is not a full cube needs on a full-cube template. Other properties such as support (the
+sturdy faces torches need) and the light-occlusion flag still come from the template.
 
 A declaration may also set `"default_state": {"facing": "north"}`. The map
 changes only those state properties on the template's default; omitted properties keep

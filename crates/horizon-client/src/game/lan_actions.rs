@@ -1256,7 +1256,10 @@ impl Game<'_> {
                     }
                     None => return false,
                 };
-                horizon_client::containers::display_name(custom(k), &key)
+                // A content mod's `container` may give its menu a literal title.
+                let declared = horizon_client::containers::block_container(name)
+                    .and_then(|d| d.title.as_deref());
+                horizon_client::containers::display_name(custom(k).or(declared), &key)
             }
             // Opened by a mod (`native_open_menu`), never here.
             Slots::Native => return false,
