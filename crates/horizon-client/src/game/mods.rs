@@ -79,6 +79,12 @@ pub(super) fn content_root(
     let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
     paths.retain(|p| !dev.contains(p));
     paths.extend(dev.iter().cloned());
+    // The items Fabric mods registered in code, as content mods of their own
+    // (rebuilt each start). They are on while their Fabric mod is loaded.
+    let fabric = super::fabric_bridge::fabric_content_mods(
+        &here.join(".horizon-cache").join("fabric-content"),
+    );
+    paths.extend(fabric.iter().cloned());
     let mut known = None;
     let mut mods: Vec<ContentMod> = Vec::new();
     // The first load's list stays (`set_local`): a reload does not hash the files again.
@@ -89,7 +95,7 @@ pub(super) fn content_root(
             continue;
         };
         let m = &package.manifest;
-        let on = enabled.contains(&m.id) || dev.contains(path);
+        let on = enabled.contains(&m.id) || dev.contains(path) || fabric.contains(path);
         if !on
             || !m.capabilities.contains(&Capability::Registries)
             || mods.iter().any(|c| c.id == m.id)

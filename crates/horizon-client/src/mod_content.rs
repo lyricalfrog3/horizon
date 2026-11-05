@@ -682,7 +682,10 @@ pub fn accept_declared(
     }
     let mut errors = Vec::new();
     for (ns, (blocks, items)) in by_namespace {
-        let result = match mods.iter().position(|m| m.id == ns) {
+        let result = match mods
+            .iter()
+            .position(|m| m.id == ns || m.content.namespaces.contains(&ns))
+        {
             Some(i) => {
                 let mut content = horizon_mods::Content::declared(&ns);
                 content.blocks.clone_from(&mods[i].content.blocks);
@@ -2297,7 +2300,13 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
     let mut additions: BTreeMap<&str, Vec<Addition>> = BTreeMap::new();
     let mut modifiers = Vec::new();
     for m in mods {
-        let declarations = format!("data/{}/horizon/", m.id);
+        let declarations: Vec<String> = m
+            .content
+            .namespaces
+            .iter()
+            .chain(std::iter::once(&m.id))
+            .map(|ns| format!("data/{ns}/horizon/"))
+            .collect();
         let mut reader = m.content.reader()?;
         for file in &m.content.files {
             let bytes = reader.read(file)?;
@@ -2312,7 +2321,7 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
                 let shared = !m.content.namespaces.iter().any(|n| n == ns);
                 let merge = tags.entry(file.clone()).or_default();
                 warnings.extend(merge.add(&m.id, file, replace, shared, values));
-            } else if !file.starts_with(&declarations) {
+            } else if !declarations.iter().any(|d| file.starts_with(d)) {
                 overlay.write(file, &bytes)?;
                 if biomes::is_modifier(file) {
                     let text = String::from_utf8(bytes).map_err(|e| format!("{file}: {e}"))?;

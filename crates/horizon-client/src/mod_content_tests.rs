@@ -3939,3 +3939,25 @@ fn a_symlink_file_is_copied_through() {
     assert_eq!(fs::read(&at).unwrap(), b"real");
     let _ = fs::remove_dir_all(&scratch);
 }
+
+/// Native declarations in a namespace a content mod lists (not its id) join
+/// that mod, not a new one.
+#[test]
+fn declarations_in_a_listed_namespace_join_the_owning_mod() {
+    use horizon_mods::content::Block;
+    let mut content = horizon_mods::Content::declared("ruby");
+    content.namespaces.push("ruby-gems".into());
+    let mut mods = vec![ContentMod {
+        id: "ruby".into(),
+        content,
+    }];
+    let block = Block {
+        id: "ruby-gems:ore".into(),
+        template: "minecraft:iron_block".into(),
+        ..Block::default()
+    };
+    let errors = accept_declared(&mut mods, &[block], &[], &BTreeSet::new());
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(mods.len(), 1);
+    assert_eq!(mods[0].content.blocks[0].id, "ruby-gems:ore");
+}

@@ -71,7 +71,8 @@ Unknown keys are refused, so a typo is an error, not a silently ignored permissi
 ### Content mods (API 0.2)
 
 A content mod has capability `registries` and carries `assets/` and `data/` in the `.hmod`. It adds blocks and items
-by declaring them in `data/<id>/horizon/block/*.json` and `data/<id>/horizon/item/*.json`, each copying a vanilla
+by declaring them in `data/<ns>/horizon/block/*.json` and `data/<ns>/horizon/item/*.json` (`<ns>` is the mod id or a
+namespace it lists, so a mod id `a_b` can own `a-b`, whose ids vanilla allows but mod ids do not), each copying a vanilla
 template ([modpacks.md](modpacks.md#registries-02-data-driven-blocks-items-and-mob-effects)), and creative tabs, mob
 effects, entity types and menu types (each below) in `creative_tab/`, `mob_effect/`, `entity_type/` and `menu/` beside
 them. LAN and dedicated server players play with them when they run the same mods: a client whose mods add different
@@ -214,7 +215,7 @@ chorus plant's (10 pixels across) unless it sets `"thickness"`, 2 to 14
 pixels: its outline and collision are then built as `PipeBlock` builds its
 own, a core and an arm to each joined side.
 
-A mod's creative inventory tabs are `data/<id>/horizon/creative_tab/*.json`:
+A mod's creative inventory tabs are `data/<ns>/horizon/creative_tab/*.json`:
 a title, the item on the tab's button, and its items in order (items the game
 doesn't have are left out):
 
@@ -234,7 +235,7 @@ the load instead of doing nothing. Behaviour the game ties to a vanilla
 item's id doesn't come along yet: a copy of the trident doesn't throw
 ([#3305](https://github.com/horizon-rust/horizon/issues/3305)).
 
-A mod effect is declared in `data/<id>/horizon/mob_effect/<name>.json` with what vanilla's `MobEffect` takes: its
+A mod effect is declared in `data/<ns>/horizon/mob_effect/<name>.json` with what vanilla's `MobEffect` takes: its
 category (`beneficial`, `harmful` or `neutral`) and its RGB colour (0 to `0xFFFFFF`), which its particles take:
 
 ```json
@@ -248,7 +249,7 @@ as vanilla's; without one it draws as the missing texture). It does nothing on i
 attribute modifiers. A world opened without the mod drops the effect from its players and mobs. Clients join a server
 only with the same mods' effects, as with its blocks.
 
-A mod entity type is declared in `data/<id>/horizon/entity_type/<name>.json`. It copies a vanilla type: for now only
+A mod entity type is declared in `data/<ns>/horizon/entity_type/<name>.json`. It copies a vanilla type: for now only
 `minecraft:snowball`, a thrown item projectile. `item` is one of the mod's own items (one type per item), and `damage`
 (0 by default) is what a hit deals to anything it hits, as `thrown` damage from the thrower (the snowball's 3 to blazes
 is not copied):
@@ -268,7 +269,7 @@ server with it may be disconnected when one spawns.
 
 #### Menu types
 
-A mod menu type (vanilla's `MenuType`) is declared in `data/<id>/horizon/menu/<name>.json`: its container's slot count
+A mod menu type (vanilla's `MenuType`) is declared in `data/<ns>/horizon/menu/<name>.json`: its container's slot count
 (1 to 256), the data slots its menu syncs (`ContainerData`, 0 to 256, 0 by default), and the slots players only take
 from (`results`, as a furnace's result slot):
 
@@ -309,7 +310,7 @@ namespaces = ["kaisyn", "towns_and_towers"]
 
 A listed namespace is the mod's as its id is: its `assets/` and `data/` files load, and the game reads its tags,
 recipes, names and loot. Blocks, items, creative tabs, mob effects, entity types and menu types are declared in
-`data/<id>/horizon/` only. `minecraft`, `c` and
+`data/<ns>/horizon/` of the mod id or any listed namespace (the id is `<ns>:<name>`). `minecraft`, `c` and
 `horizon` cannot be listed. Two mods that are on may not own the same namespace (one's id or listed namespace being
 the other's): the game keeps the first in load order and leaves the other's content out, with "mods A and B both use
 the namespace N; turn one of them off" in the log. Paths use vanilla's resource characters, at most 65,536 files, 16

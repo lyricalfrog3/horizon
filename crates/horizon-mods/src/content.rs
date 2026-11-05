@@ -1,7 +1,8 @@
 //! A content mod's `assets/` and `data/` (API 0.2, docs/modpacks.md): the
 //! files it adds to the game's resource tree, and the blocks, items, mob
 //! effects, entity types and menu types it declares in
-//! `data/<id>/horizon/{block,item,mob_effect,entity_type,menu}/`.
+//! `data/<namespace>/horizon/{block,item,mob_effect,entity_type,menu}/`, for
+//! any namespace the mod owns (its id, or one its manifest lists).
 //!
 //! Content is data, not code: nothing here runs in the sandbox. What a mod
 //! may add is fenced instead. Its own namespaces (its id and the ones its
@@ -608,8 +609,7 @@ impl Content {
                 parts.next().unwrap_or(""),
                 parts.next().unwrap_or(""),
             );
-            let own = namespace == id;
-            let owned = own || manifest.namespaces.iter().any(|n| n == namespace);
+            let owned = namespace == id || manifest.namespaces.iter().any(|n| n == namespace);
             // Vanilla's own files stay vanilla's; a mod may only add to its
             // tags, and to the convention tags mods share.
             let shared = matches!(namespace, "minecraft" | "c");
@@ -619,12 +619,12 @@ impl Content {
                     "{name}: a mod adds files in its own namespaces ({top}/{id}/ and those listed in namespaces) or to vanilla and convention (c) tags"
                 ));
             }
-            if !own && top == "data" && rest.starts_with("horizon/") {
+            if !owned && top == "data" && rest.starts_with("horizon/") {
                 return Err(format!(
-                    "{name}: blocks, items, mob effects, entity types and menu types are declared in data/{id}/horizon/"
+                    "{name}: blocks, items, mob effects, entity types and menu types are declared in data/<namespace>/horizon/ of a namespace the mod owns (its id or one listed in namespaces)"
                 ));
             }
-            let Some(decl) = (own && top == "data")
+            let Some(decl) = (owned && top == "data")
                 .then(|| rest.strip_prefix("horizon/"))
                 .flatten()
             else {
@@ -635,7 +635,7 @@ impl Content {
                     .strip_prefix(kind)?
                     .strip_prefix('/')?
                     .strip_suffix(".json")?;
-                Some(format!("{id}:{path}"))
+                Some(format!("{namespace}:{path}"))
             };
             if let Some(block) = parse("block") {
                 blocks.push((block, name.clone()));
@@ -651,7 +651,7 @@ impl Content {
                 menus.push((menu, name.clone()));
             } else {
                 return Err(format!(
-                    "{name}: data/{id}/horizon/ holds block/, item/, mob_effect/, creative_tab/, entity_type/ and menu/*.json only"
+                    "{name}: data/{namespace}/horizon/ holds block/, item/, mob_effect/, creative_tab/, entity_type/ and menu/*.json only"
                 ));
             }
         }
@@ -1710,6 +1710,37 @@ capabilities = ["registries"]
     }
 
     #[test]
+    fn declares_under_a_listed_namespace() {
+        let manifest = format!("{MANIFEST_TEXT}namespaces = [\"ruby-gems\"]\n");
+        let content = hmod(
+            "listed-ns",
+            &manifest,
+            &[
+                ("data/ruby-gems/horizon/item/gem.json", ITEM),
+                ("data/ruby/horizon/block/ore.json", BLOCK),
+            ],
+        )
+        .unwrap();
+        assert_eq!(content.items[0].id, "ruby-gems:gem");
+        assert_eq!(content.blocks[0].id, "ruby:ore");
+        // A namespace the manifest does not list is still refused.
+        let e = hmod(
+            "unlisted-ns",
+            &manifest,
+            &[("data/other-gems/horizon/item/gem.json", ITEM)],
+        )
+        .unwrap_err();
+        assert!(e.contains("own namespaces"), "{e}");
+        let e = hmod(
+            "unlisted-ns-plain",
+            MANIFEST_TEXT,
+            &[("data/ruby-gems/horizon/item/gem.json", ITEM)],
+        )
+        .unwrap_err();
+        assert!(e.contains("own namespaces"), "{e}");
+    }
+
+    #[test]
     fn refuses_content_outside_its_fence() {
         let refused = |name: &str, files: &[(&str, &[u8])]| {
             let e = hmod(name, MANIFEST_TEXT, files).unwrap_err();
@@ -1895,10 +1926,13 @@ capabilities = ["registries"]
         let content = hmod("listed", &manifest, files).unwrap();
         assert_eq!(content.files.len(), 3);
         assert_eq!(content.namespaces, ["ruby", "kaisyn"]);
-        // Declarations stay in the id's namespace.
+        // Declarations may sit in any owned namespace.
         let decl: &[(&str, &[u8])] = &[("data/kaisyn/horizon/block/a.json", BLOCK)];
-        let e = hmod("listed-decl", &manifest, decl).unwrap_err();
-        assert!(e.contains("declared in data/ruby/horizon/"), "{e}");
+        let content = hmod("listed-decl", &manifest, decl).unwrap();
+        assert_eq!(content.blocks[0].id, "kaisyn:a");
+        // Not in one it does not own.
+        let decl: &[(&str, &[u8])] = &[("data/other/horizon/block/a.json", BLOCK)];
+        assert!(hmod("listed-decl-other", &manifest, decl).is_err());
         // A namespace it does not list is still outside.
         let other: &[(&str, &[u8])] = &[("data/other/structure/a.nbt", b"nbt")];
         assert!(hmod("listed-other", &manifest, other).is_err());

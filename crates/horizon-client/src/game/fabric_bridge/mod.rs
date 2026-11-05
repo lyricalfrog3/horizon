@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+mod content;
 mod gui;
 mod keys;
 mod menu;
@@ -21,6 +22,7 @@ pub(super) use gui::{
     fabric_screen_draws, fabric_screen_key, fabric_screen_mouse, fabric_screen_mouse_moved,
     fabric_screen_open, fabric_screen_scroll, replay_fabric_draws, translate_draw,
 };
+pub(super) use content::fabric_content_mods;
 pub(super) use menu::{draw_menu_widgets, menu_widget_press};
 
 #[allow(unused_imports)]
