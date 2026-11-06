@@ -35,3 +35,4 @@
 
 # Release-only compiled original exporter bundle.
 /exporters/
+.cheapag/
