@@ -198,13 +198,27 @@ impl std::ops::DerefMut for ModBlockEntity {
 /// and the slots hoppers may put into (`canPlaceItemThroughFace`) and take
 /// from (`canTakeItemThroughFace`); and the vanilla menu that shows its
 /// slots when the block is used, if any (`MOD_MENUS`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModContainer {
     pub slots: usize,
+    /// `Container.getMaxStackSize()`: how many of an item one slot holds.
+    pub max_stack: u32,
     pub faces: [Vec<usize>; 6],
     pub inputs: Vec<usize>,
     pub outputs: Vec<usize>,
     pub menu: Option<String>,
+}
+impl Default for ModContainer {
+    fn default() -> Self {
+        Self {
+            slots: 0,
+            max_stack: 64,
+            faces: std::array::from_fn(|_| Vec::new()),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            menu: None,
+        }
+    }
 }
 /// The fluid tanks of a mod block's block entity, in the container's shape:
 /// each tank's capacity in millibuckets, the tanks each face reaches, and

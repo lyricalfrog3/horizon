@@ -650,10 +650,42 @@ pub(super) fn declare(block: &RegisteredBlock, vanilla: &Vanilla) -> Result<Decl
                 container.insert("slots".into(), c.slots.into());
                 container.insert("menu".into(), c.menu_type.clone().into());
                 // Vanilla's default name is the block's own; a title that is
-                // that key was not set by the mod.
+                // that key was not set by the mod. A translation key is kept
+                // when the mod's `getDisplayName` was a translatable.
                 let default = format!("block.{}", block.id.replace(':', "."));
-                if let Some(title) = c.title.as_ref().filter(|t| **t != default && !t.is_empty()) {
-                    container.insert("title".into(), title.clone().into());
+                let title = c
+                    .title_key
+                    .as_ref()
+                    .filter(|k| **k != default && !k.is_empty())
+                    .map(|k| ("title_key", k))
+                    .or_else(|| {
+                        c.title
+                            .as_ref()
+                            .filter(|t| **t != default && !t.is_empty())
+                            .map(|t| ("title", t))
+                    });
+                if let Some((name, text)) = title {
+                    container.insert(name.into(), text.clone().into());
+                }
+                // Vanilla's `Container.getMaxStackSize` is 64; only a mod's
+                // own answer is declared.
+                if let Some(max) = c.max_stack_size.filter(|m| *m != 64) {
+                    container.insert("max_stack_size".into(), max.into());
+                }
+                // Every slot is reachable from every face unless the block
+                // entity is a `WorldlyContainer` that says otherwise.
+                if let Some(faces) = &c.faces {
+                    let all: Vec<usize> = (0..c.slots).collect();
+                    if faces.iter().any(|slots| *slots != all) {
+                        let mut by_face = Map::new();
+                        for (name, slots) in ["down", "up", "north", "south", "west", "east"]
+                            .into_iter()
+                            .zip(faces)
+                        {
+                            by_face.insert(name.into(), json!(slots));
+                        }
+                        container.insert("faces".into(), Value::Object(by_face));
+                    }
                 }
                 file.insert("container".into(), Value::Object(container));
                 notes.push(
@@ -661,6 +693,14 @@ pub(super) fn declare(block: &RegisteredBlock, vanilla: &Vanilla) -> Result<Decl
                      Horizon's; its ticking and any other code of the entity are not run"
                         .into(),
                 );
+                notes.push(
+                    "its container's per-slot rules (canPlaceItem, and the through-face \
+                     canPlaceItemThroughFace/canTakeItemThroughFace) are not run"
+                        .into(),
+                );
+                for note in &c.notes {
+                    notes.push(format!("its container: {note}"));
+                }
             }
             ContainerRead::Container(c) => notes.push(format!(
                 "its container ({} slots, menu {}) has no menu in Horizon; the block stays decoration",
@@ -936,6 +976,10 @@ mod tests {
                 slots: 27,
                 menu_type: "minecraft:generic_9x3".into(),
                 title: Some("Storage".into()),
+                title_key: None,
+                max_stack_size: Some(8),
+                faces: None,
+                notes: Vec::new(),
             }),
             unreadable: Vec::new(),
         }
@@ -975,7 +1019,8 @@ mod tests {
         // what its `getDisplayName` answered.
         assert_eq!(
             json["container"],
-            json!({"slots": 27, "menu": "minecraft:generic_9x3", "title": "Storage"})
+            json!({"slots": 27, "menu": "minecraft:generic_9x3", "title": "Storage",
+                   "max_stack_size": 8})
         );
         assert!(
             declared.notes.iter().any(|n| n.contains("is a container")),
@@ -1011,6 +1056,59 @@ mod tests {
     }
 
     #[test]
+    fn a_container_declares_its_face_slots_and_translation_key() {
+        let mut block = cabinet();
+        let all: Vec<usize> = (0..27).collect();
+        let mut faces: [Vec<usize>; 6] = std::array::from_fn(|_| all.clone());
+        // `getSlotsForFace(DOWN)` reaches one slot; the rest stay open.
+        faces[0] = vec![1];
+        block.container = ContainerRead::Container(BlockContainer {
+            slots: 27,
+            menu_type: "minecraft:generic_9x3".into(),
+            title: Some("Storage".into()),
+            title_key: Some("container.ex_cabinet".into()),
+            max_stack_size: Some(8),
+            faces: Some(faces),
+            notes: vec!["getMaxStackSize could not be read".into()],
+        });
+        let declared = declare(&block, &vanilla()).unwrap();
+        let container = &declared.json["container"];
+        // A translation key is preferred over the literal it resolved to.
+        assert_eq!(container["title_key"], "container.ex_cabinet");
+        assert!(container.get("title").is_none());
+        assert_eq!(container["max_stack_size"], 8);
+        assert_eq!(container["faces"]["down"], json!([1]));
+        assert_eq!(container["faces"]["up"], json!(all));
+        assert!(
+            declared
+                .notes
+                .iter()
+                .any(|n| n.contains("getMaxStackSize could not be read")),
+            "{:?}",
+            declared.notes
+        );
+        // What the content fence accepts.
+        let text = serde_json::to_vec(&declared.json).unwrap();
+        let files: &[(&str, &[u8])] = &[("data/ex/horizon/block/cabinet.json", &text)];
+        let manifest = "id = \"ex\"\nname = \"Ex\"\nversion = \"1\"\napi = \"0.2\"\ncapabilities = [\"registries\"]\n";
+        let dir = std::env::temp_dir().join(format!("hfc-block-container-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.hmod");
+        std::fs::write(
+            &path,
+            horizon_mods::manifest::Package::write_files(manifest, None, files).unwrap(),
+        )
+        .unwrap();
+        let package = horizon_mods::manifest::Package::read(&path).unwrap();
+        let content = horizon_mods::content::Content::read(&path, &package.manifest).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let container = content.blocks[0].container.as_ref().unwrap();
+        assert_eq!(container.max_stack_size, Some(8));
+        assert_eq!(container.title_key.as_deref(), Some("container.ex_cabinet"));
+        assert_eq!(container.faces.as_ref().unwrap()["down"], vec![1]);
+    }
+
+    #[test]
     fn a_container_without_a_set_title_or_a_menu_horizon_has_stays_what_it_can() {
         // A display name that is the block's own key was not set by the mod.
         let mut block = cabinet();
@@ -1018,6 +1116,10 @@ mod tests {
             slots: 27,
             menu_type: "minecraft:generic_9x3".into(),
             title: Some("block.ex.cabinet".into()),
+            title_key: None,
+            max_stack_size: None,
+            faces: None,
+            notes: Vec::new(),
         });
         let json = declare(&block, &vanilla()).unwrap().json;
         assert_eq!(
@@ -1032,6 +1134,10 @@ mod tests {
                 slots,
                 menu_type: menu.into(),
                 title: None,
+                title_key: None,
+                max_stack_size: None,
+                faces: None,
+                notes: Vec::new(),
             });
             let declared = declare(&block, &vanilla()).unwrap();
             assert!(declared.json.get("container").is_none(), "{menu}");

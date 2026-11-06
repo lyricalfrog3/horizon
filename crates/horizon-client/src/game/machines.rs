@@ -171,6 +171,15 @@ impl Containers<'_> {
             .map_or(64, |i| i.max_stack)
             .max(1)
     }
+    /// How many of `stack` a slot of `view` holds: the stack's own limit,
+    /// capped by the container's `getMaxStackSize` for a mod's block entity.
+    fn slot_capacity(&self, view: &View, stack: &ItemStack) -> u32 {
+        let own = self.max_stack(stack);
+        match &view.container {
+            Some(c) => own.min(c.max_stack.clamp(1, 99)),
+            None => own,
+        }
+    }
     /// `HopperBlockEntity.getBlockContainer` (double chests combined, right half
     /// first). `blocked_chests`: `ChestBlock.getContainer(.., false)` returns
     /// nothing for a chest under a redstone conductor.
@@ -386,7 +395,7 @@ impl Containers<'_> {
     fn is_full(&self, view: &View, face: Direction) -> bool {
         view.slots_for_face(Some(face)).into_iter().all(|i| {
             self.get(view, i)
-                .is_some_and(|s| s.count >= self.max_stack(s))
+                .is_some_and(|s| s.count >= self.slot_capacity(view, &s))
         })
     }
     /// `AbstractContainerMenu.getRedstoneSignalFromContainer`.
@@ -401,7 +410,7 @@ impl Containers<'_> {
         let mut total = 0.0f32;
         for i in 0..view.len() {
             if let Some(s) = self.get(view, i) {
-                total += s.count as f32 / self.max_stack(s) as f32;
+                total += s.count as f32 / self.slot_capacity(view, &s) as f32;
             }
         }
         total /= view.len().max(1) as f32;
@@ -611,7 +620,7 @@ impl Game<'_> {
             return (Some(stack), false);
         }
         let was_empty = c.is_empty(view);
-        let max = c.max_stack(&stack);
+        let max = c.slot_capacity(view, &stack);
         let mut success = false;
         let Some(target) = self.slot_mut_at(view, slot) else {
             return (Some(stack), false);
@@ -1648,6 +1657,7 @@ mod mod_container_tests {
             kind: Kind::Mod,
             container: Some(Arc::new(ModContainer {
                 slots: 3,
+                max_stack: 64,
                 faces,
                 inputs: vec![0, 1],
                 outputs: vec![2],

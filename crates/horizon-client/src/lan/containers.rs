@@ -256,6 +256,7 @@ impl Hub {
         g.menu = Some(Menu {
             window,
             kind,
+            max_stack: 99,
             pos: Some(pos),
             slots,
             size: items.len(),
@@ -269,6 +270,19 @@ impl Hub {
         self.send_menu_content(i, items);
     }
 
+    /// The open menu of `conn` holds `max_stack` of an item in each of its
+    /// container slots (`Container.getMaxStackSize`): a mod block's own, when
+    /// its declaration says so.
+    pub fn set_menu_max_stack(&mut self, conn: u32, max_stack: u32) {
+        if let Some(m) = self
+            .guests
+            .iter_mut()
+            .find(|g| g.conn == conn)
+            .and_then(|g| g.menu.as_mut())
+        {
+            m.max_stack = max_stack.clamp(1, 99);
+        }
+    }
     /// The open menu of `conn` has no `hidden` container slots: a mod's screen
     /// does not show them, so a click or a shift-click never reaches them.
     pub fn hide_menu_slots(&mut self, conn: u32, hidden: Vec<usize>) {
@@ -315,6 +329,7 @@ impl Hub {
         g.menu = Some(Menu {
             window,
             kind,
+            max_stack: 99,
             pos: None,
             slots: Slots::Native,
             size,
@@ -560,6 +575,12 @@ impl Hub {
             .as_ref()
             .filter(|_| in_menu)
             .map_or_else(Vec::new, |m| m.hidden.clone());
+        let max_stack = self.guests[i]
+            .menu
+            .as_ref()
+            .filter(|_| in_menu)
+            .map_or(99, |m| m.max_stack);
+
         let guest = &mut self.guests[i];
         let mut items = source.and_then(|s| s.read(world, guest));
         if in_menu && items.is_none() {
@@ -570,6 +591,7 @@ impl Hub {
             container: items.as_deref_mut(),
             shulker,
             hidden: &hidden,
+            max_stack,
         };
         let (drops, changed) = menu::click(
             &mut view,

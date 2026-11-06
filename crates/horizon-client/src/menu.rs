@@ -272,6 +272,10 @@ const OFFHAND: usize = 40;
 
 pub struct Menu {
     kind: Kind,
+    /// `Container.getMaxStackSize()` of the block container it shows: 99 (no
+    /// limit beyond the slot's) for vanilla's, a mod block's own for a mod
+    /// container (`containers::ModContainer`).
+    pub container_max_stack: u32,
     slots: Vec<Slot>,
     containers: [Vec<Option<ItemStack>>; 4],
     grid_size: usize,
@@ -744,6 +748,7 @@ impl Menu {
         containers[RESULT] = vec![None; 1];
         Self {
             kind,
+            container_max_stack: CONTAINER_MAX,
             slots,
             containers,
             grid_size,
@@ -1504,6 +1509,12 @@ impl Menu {
             // `Container.getMaxStackSize` is vanilla's 99, which no data pack's
             // item reaches; a native mod's item may, and its own size is the cap.
             _ => u32::MAX,
+        };
+        // A block container's own `getMaxStackSize` caps its slots (a mod
+        // furniture's 8), as `Slot.getMaxStackSize` asks the container.
+        let own = match self.slots[s].container == MAIN {
+            true => own.min(self.container_max_stack),
+            false => own,
         };
         own.min(Self::max_stack(env, stack))
     }

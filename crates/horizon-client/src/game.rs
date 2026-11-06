@@ -2890,6 +2890,10 @@ struct Game<'a> {
     remote: Option<remote::Remote>,
     /// This world is open to the network (game/lan.rs).
     lan: Option<lan::LanHost>,
+    /// Mod block ticks Fabric block code scheduled (`Level.scheduleTick`):
+    /// the game tick they are due, the dimension, the position and the block
+    /// id. Run by `tick_fabric_blocks` on the server thread.
+    fabric_block_ticks: Vec<(u64, String, [i32; 3], String)>,
     /// Single player's server thread, which `remote` is connected to.
     integrated: Option<integrated::Integrated>,
     /// The shapes of the open world's levels, from its dimension types.
@@ -6133,7 +6137,14 @@ impl Game<'_> {
         // canceled click does nothing (a guest's block is sent back).
         if let Some(hit) = block_hit {
             let mut canceled = false;
-            self.native_right_click_block(hit.pos, hit.face, &mut canceled);
+            self.native_right_click_block(
+                hit.pos,
+                hit.face,
+                hit.point,
+                sneaking,
+                self.hand == crate::first_person::Hand::Off,
+                &mut canceled,
+            );
             if canceled {
                 // Nothing was used, so nothing consumed the action.
                 self.use_failed = true;
@@ -7344,6 +7355,9 @@ impl Game<'_> {
         if running {
             horizon_client::spans::time("tick_lan_packets", || self.tick_lan_packets());
             horizon_client::spans::time("tick_blocks", || self.tick_blocks())?;
+            // The block ticks Fabric block code scheduled, beside the level's
+            // own scheduled ticks.
+            horizon_client::spans::time("tick_fabric_blocks", || self.tick_fabric_blocks());
             // What the blocks spawned (a dispensed minecart, a lit TNT, a
             // placed boat) joins before the entities tick.
             self.native_joins_flush(false, 0);
@@ -9514,6 +9528,19 @@ impl Game<'_> {
             None => game_of.iter().position(|x| *x == Some(g)),
         };
         let mut menu = Menu::new(kind);
+        // A content mod's block container may hold fewer than a stack in a
+        // slot (`Container.getMaxStackSize`).
+        if let Some(key) = self.container {
+            let name = self
+                .res
+                .facts()
+                .get(self.world.block(key.0, key.1, key.2))
+                .name
+                .clone();
+            if let Some(declared) = horizon_client::containers::block_container(&name) {
+                menu.container_max_stack = declared.container.max_stack;
+            }
+        }
         if matches!(kind, Kind::Mount(_)) {
             menu.mount = self.mount_menu_entity();
         }
@@ -18787,6 +18814,7 @@ impl<'a> Game<'a> {
             entity_attachments: Default::default(),
             remote: None,
             lan: None,
+            fabric_block_ticks: Vec::new(),
             integrated: None,
             level_shapes: Default::default(),
             serving: None,

@@ -24,6 +24,9 @@ pub struct Menu {
     pub window: i32,
     /// The `minecraft:menu` registry id.
     pub kind: i32,
+    /// `Container.getMaxStackSize()` of the block container shown: 99 (the
+    /// slot's own cap) for vanilla's, a mod block's own for a mod container.
+    pub max_stack: u32,
     pub pos: Option<(i32, i32, i32)>,
     /// Where the container's slots live.
     pub slots: Slots,
@@ -191,6 +194,8 @@ pub struct View<'a> {
     pub shulker: bool,
     /// Container slots that do not exist in this menu (see [`Menu::hidden`]).
     pub hidden: &'a [usize],
+    /// How many of a stack the container's slots hold (`getMaxStackSize`).
+    pub max_stack: u32,
 }
 
 impl View<'_> {
@@ -245,7 +250,11 @@ impl View<'_> {
         if self.container.is_none() && (5..=8).contains(&i) {
             return 1;
         }
-        rules.max_stack(&stack.item).max(1)
+        let own = rules.max_stack(&stack.item).max(1);
+        match self.container.as_ref() {
+            Some(c) if i < c.len() => own.min(self.max_stack.clamp(1, 99)),
+            _ => own,
+        }
     }
     /// The ranges quick move uses: (container start..end, main, hotbar).
     fn player_ranges(&self) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
@@ -827,6 +836,7 @@ mod tests {
             guest: &mut g,
             container: Some(&mut chest),
             shulker: false,
+            max_stack: 99,
             hidden: &[],
         };
         view.guest.carried = Some(ItemStack::new("minecraft:bundle", 1));
@@ -859,6 +869,37 @@ mod tests {
             Some(("minecraft:ender_pearl", 16))
         );
         assert_eq!(contents(&view.get(2)), []);
+    }
+
+    /// A container that holds 8 of an item takes 8 in a slot, not a stack:
+    /// `Container.getMaxStackSize` (a mod furniture's own answer).
+    #[test]
+    fn a_container_stack_limit_caps_a_click() {
+        let Some(rules) = rules() else {
+            return;
+        };
+        let mut g = guest();
+        let mut container = vec![None; 3];
+        let mut drag = None;
+        let mut view = View {
+            guest: &mut g,
+            container: Some(&mut container),
+            shulker: false,
+            max_stack: 8,
+            hidden: &[],
+        };
+        view.guest.carried = Some(ItemStack::new("minecraft:stone", 64));
+        // Left click with a carried stack: as much of it as the slot holds.
+        click(&mut view, &mut drag, 0, 0, input::PICKUP, &rules);
+        assert_eq!(view.get(0).map(|s| s.count), Some(8));
+        assert_eq!(view.guest.carried.as_ref().map(|s| s.count), Some(56));
+        // A shift-click from the inventory fills the rest of the container's
+        // slots to their own limit.
+        view.guest.inventory[0] = Some(ItemStack::new("minecraft:dirt", 64));
+        click(&mut view, &mut drag, 3 + 27, 0, input::QUICK_MOVE, &rules);
+        assert_eq!(view.get(1).map(|s| s.count), Some(8));
+        assert_eq!(view.get(2).map(|s| s.count), Some(8));
+        assert_eq!(view.guest.inventory[0].as_ref().map(|s| s.count), Some(48));
     }
 
     /// A mod container saved with more items than its menu has slots: the
@@ -903,6 +944,7 @@ mod tests {
                 guest: &mut g,
                 container: Some(&mut read),
                 shulker: false,
+                max_stack: 99,
                 hidden: &[],
             };
             click(&mut view, &mut drag, 5 + 27, 0, input::QUICK_MOVE, &rules);
@@ -940,6 +982,7 @@ mod tests {
             guest: &mut g,
             container: Some(&mut container),
             shulker: false,
+            max_stack: 99,
             hidden: &hidden,
         };
         // The hotbar's first slot (menu slot 3 + 27) lands in the one slot shown.
@@ -977,6 +1020,7 @@ mod tests {
             guest: &mut g,
             container: Some(&mut chest),
             shulker: false,
+            max_stack: 99,
             hidden: &[],
         };
         click(&mut view, &mut drag, 0, 40, input::SWAP, &rules);
@@ -1022,6 +1066,7 @@ mod tests {
                 guest: &mut g,
                 container: Some(&mut container),
                 shulker,
+                max_stack: 99,
                 hidden: &[],
             };
             // Carried onto an empty slot, shift-clicked from the hotbar

@@ -296,6 +296,12 @@ impl Game<'_> {
             .take()
             .filter(|(window, m)| *window == p.container && m.kind() == kind)
             .map_or_else(|| Box::new(Menu::new(kind)), |(_, m)| m);
+        // A content mod's block may hold fewer than a stack in a slot.
+        let block = self.world.block(pos.0, pos.1, pos.2);
+        let name = self.res.facts().get(block).name.clone();
+        if let Some(declared) = horizon_client::containers::block_container(&name) {
+            menu.container_max_stack = declared.container.max_stack;
+        }
         for &slot in &hidden {
             menu.hide_slot(slot);
         }

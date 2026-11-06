@@ -1256,10 +1256,11 @@ impl Game<'_> {
                     }
                     None => return false,
                 };
-                // A content mod's `container` may give its menu a literal title.
-                let declared = horizon_client::containers::block_container(name)
-                    .and_then(|d| d.title.as_deref());
-                horizon_client::containers::display_name(custom(k).or(declared), &key)
+                // A content mod's `container` may give its menu a translation
+                // key or a literal title.
+                let declared =
+                    horizon_client::containers::block_container(name).map(|d| d.as_ref());
+                horizon_client::containers::declared_name(custom(k), declared, &key)
             }
             // Opened by a mod (`native_open_menu`), never here.
             Slots::Native => return false,
@@ -1355,6 +1356,17 @@ impl Game<'_> {
         let hidden = self.native_hidden_slots(pos, items.len());
         host.hub
             .open_container(conn, menu, title, pos, slots, items);
+        // A content mod's block may hold fewer than a stack in a slot.
+        let block_name = self
+            .res
+            .facts()
+            .get(self.world.block(pos.0, pos.1, pos.2))
+            .name
+            .clone();
+        if let Some(declared) = horizon_client::containers::block_container(&block_name) {
+            host.hub
+                .set_menu_max_stack(conn, declared.container.max_stack);
+        }
         if !hidden.is_empty() {
             host.hub.hide_menu_slots(conn, hidden);
         }

@@ -256,6 +256,19 @@ pub struct BlockContainer {
     /// (`block.<id>.<path>`) when unset.
     #[serde(default)]
     pub title: Option<String>,
+    /// The menu's title as a translation key (the mod's own lang files
+    /// translate it); preferred over `title` when both are set.
+    #[serde(default)]
+    pub title_key: Option<String>,
+    /// `getMaxStackSize()`: how many of an item one slot holds, 1 to 99.
+    /// Vanilla's 64 when unset.
+    #[serde(default)]
+    pub max_stack_size: Option<u16>,
+    /// `WorldlyContainer.getSlotsForFace` per face (`down`, `up`, `north`,
+    /// `south`, `west`, `east`): the container slots each face reaches. Every
+    /// slot from every face when unset.
+    #[serde(default)]
+    pub faces: Option<BTreeMap<String, Vec<u16>>>,
 }
 
 /// A block the mod adds: a vanilla template's behaviour, states and shapes
@@ -1014,6 +1027,41 @@ fn check_container(
         return Err(format!(
             "{block}: container title is 1 to 256 bytes (leave it out for the block's name)"
         ));
+    }
+    if container
+        .title_key
+        .as_deref()
+        .is_some_and(|t| t.is_empty() || t.len() > 256)
+    {
+        return Err(format!(
+            "{block}: container title_key is 1 to 256 bytes (leave it out for the block's name)"
+        ));
+    }
+    if container
+        .max_stack_size
+        .is_some_and(|n| !(1..=99).contains(&n))
+    {
+        return Err(format!(
+            "{block}: container max_stack_size is 1 to 99 (leave it out for 64)"
+        ));
+    }
+    if let Some(faces) = &container.faces {
+        for (face, slots) in faces {
+            if !matches!(
+                face.as_str(),
+                "down" | "up" | "north" | "south" | "west" | "east"
+            ) {
+                return Err(format!(
+                    "{block}: container face {face:?} is down, up, north, south, west or east"
+                ));
+            }
+            if let Some(slot) = slots.iter().find(|s| **s >= container.slots) {
+                return Err(format!(
+                    "{block}: container face {face} reaches slot {slot}, out of its {} slots",
+                    container.slots
+                ));
+            }
+        }
     }
     if let Some(own) = menus.iter().find(|m| m.id == container.menu) {
         if own.slots != container.slots {
@@ -1787,7 +1835,10 @@ capabilities = ["registries"]
         let block = |container: &str| {
             format!(r#"{{"template": "minecraft:stone", "container": {container}}}"#)
         };
-        let ok = block(r#"{"slots": 27, "menu": "minecraft:generic_9x3", "title": "Storage"}"#);
+        let ok = block(
+            r#"{"slots": 27, "menu": "minecraft:generic_9x3", "title": "Storage",
+                "max_stack_size": 8, "faces": {"up": [0, 2], "down": [1]}}"#,
+        );
         let own = block(r#"{"slots": 4, "menu": "ruby:bag"}"#);
         let files: &[(&str, &[u8])] = &[
             ("data/ruby/horizon/block/chest.json", ok.as_bytes()),
@@ -1808,7 +1859,10 @@ capabilities = ["registries"]
                     BlockContainer {
                         slots: 4,
                         menu: "ruby:bag".into(),
-                        title: None
+                        title: None,
+                        title_key: None,
+                        max_stack_size: None,
+                        faces: None,
                     }
                 ),
                 (
@@ -1816,7 +1870,13 @@ capabilities = ["registries"]
                     BlockContainer {
                         slots: 27,
                         menu: "minecraft:generic_9x3".into(),
-                        title: Some("Storage".into())
+                        title: Some("Storage".into()),
+                        title_key: None,
+                        max_stack_size: Some(8),
+                        faces: Some(std::collections::BTreeMap::from([
+                            ("down".into(), vec![1]),
+                            ("up".into(), vec![0, 2]),
+                        ])),
                     }
                 ),
             ]
@@ -1849,8 +1909,23 @@ capabilities = ["registries"]
             ),
             (
                 "c-key",
-                r#"{"slots": 5, "menu": "minecraft:hopper", "faces": 1}"#,
+                r#"{"slots": 5, "menu": "minecraft:hopper", "titel": "x"}"#,
                 "unknown field",
+            ),
+            (
+                "c-max",
+                r#"{"slots": 5, "menu": "minecraft:hopper", "max_stack_size": 0}"#,
+                "max_stack_size is 1 to 99",
+            ),
+            (
+                "c-face",
+                r#"{"slots": 5, "menu": "minecraft:hopper", "faces": {"sideways": []}}"#,
+                "down, up, north, south, west or east",
+            ),
+            (
+                "c-face-slot",
+                r#"{"slots": 5, "menu": "minecraft:hopper", "faces": {"up": [5]}}"#,
+                "reaches slot 5",
             ),
             ("c-missing", r#"{"slots": 5}"#, "missing field"),
         ] {

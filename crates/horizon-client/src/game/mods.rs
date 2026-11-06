@@ -298,11 +298,34 @@ fn register_block_containers(mods: &[horizon_client::mod_content::ContentMod]) {
         }
     }
     let set = containers::register_block_containers(blocks.iter().map(|(id, c)| {
+        let slots = usize::from(c.slots);
+        let all: Vec<usize> = (0..slots).collect();
+        // The block entity's `getSlotsForFace`, in `Direction` order; every
+        // slot from every face when it is not a `WorldlyContainer` (or the
+        // runtime could not read it).
+        let faces = match &c.faces {
+            Some(faces) => std::array::from_fn(|i| {
+                faces
+                    .get(["down", "up", "north", "south", "west", "east"][i])
+                    .map(|slots| slots.iter().map(|s| usize::from(*s)).collect())
+                    .unwrap_or_default()
+            }),
+            None => std::array::from_fn(|_| all.clone()),
+        };
         (
             (*id).to_owned(),
-            usize::from(c.slots),
-            c.menu.clone(),
-            c.title.clone(),
+            containers::DeclaredContainer {
+                container: containers::ModContainer {
+                    slots,
+                    max_stack: c.max_stack_size.map(u32::from).unwrap_or(64),
+                    faces,
+                    inputs: all.clone(),
+                    outputs: all,
+                    menu: Some(c.menu.clone()),
+                },
+                title: c.title.clone(),
+                title_key: c.title_key.clone(),
+            },
         )
     }));
     if !set

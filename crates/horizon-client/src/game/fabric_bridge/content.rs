@@ -101,11 +101,21 @@ pub(in super::super) fn fabric_content_mods(out: &Path, base: &Path) -> Vec<Path
 
 /// The registered blocks, with their shapes. Shapes cost Minecraft's own
 /// `VoxelShape` bytecode (seconds for a big mod), so they are read once per
-/// run, here, on the thread that builds the content root.
+/// run, here, on the thread that builds the content root. A later start with
+/// the same classpath reads the facts *and* their shapes back from
+/// `.horizon-cache/fabric-blocks` instead (`hfc_runtime`'s `block_cache`), so
+/// it skips both this and `collect_block_facts`.
 fn registered_blocks(bridge: &mut hfc_runtime::bridge::FabricBridge) -> Vec<RegisteredBlock> {
     static SHAPES_READ: std::sync::Once = std::sync::Once::new();
     let mut blocks = bridge.registered_blocks();
     if blocks.is_empty() {
+        return blocks;
+    }
+    if bridge.block_facts_from_cache() && bridge.block_facts_shapes_known() {
+        log::info!(
+            "Fabric: facts and shapes of {} registered block(s) from the block facts cache",
+            blocks.len()
+        );
         return blocks;
     }
     SHAPES_READ.call_once(|| {
@@ -116,6 +126,14 @@ fn registered_blocks(bridge: &mut hfc_runtime::bridge::FabricBridge) -> Vec<Regi
             blocks.len(),
             started.elapsed()
         );
+        // The facts are complete now (shapes included): keep them for the next
+        // start with this classpath. Written atomically, under the game
+        // folder's `.horizon-cache/`, and only ever read back for the same jar
+        // hashes, runtime version and facts version.
+        match bridge.store_block_facts_cache() {
+            Some(path) => log::info!("Fabric: block facts cached in {}", path.display()),
+            None => log::debug!("Fabric: block facts not cached (no cache dir or nothing read)"),
+        }
     });
     blocks = bridge.registered_blocks();
     blocks

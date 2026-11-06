@@ -302,6 +302,9 @@ impl hfc_runtime::bridge::HostBridge for HostBridgeAdapter<'_, '_> {
     fn held_item(&self) -> Option<String> {
         self.0.held().map(|s| s.item.to_string())
     }
+    fn off_hand_item(&self) -> Option<String> {
+        self.0.offhand.as_ref().map(|s| s.item.to_string())
+    }
     fn block_properties(&self, pos: [i32; 3]) -> Vec<(String, String)> {
         let state = self.0.world.block(pos[0], pos[1], pos[2]);
         self.0
@@ -341,6 +344,37 @@ impl hfc_runtime::bridge::HostBridge for HostBridgeAdapter<'_, '_> {
         let _ = self.0.native_give(item, count);
         self.0.pop_resource(pos, ItemStack::new(item, count));
     }
+    fn schedule_block_tick(&mut self, pos: [i32; 3], block: &str, delay: u32) {
+        // A block that reschedules itself forever must not grow the queue
+        // without bound.
+        if self.0.fabric_block_ticks.len() >= 4096 {
+            return;
+        }
+        let due = u64::from(self.0.ticks) + u64::from(delay.max(1));
+        let dimension = self.0.dim.id().to_string();
+        self.0
+            .fabric_block_ticks
+            .push((due, dimension, pos, block.to_string()));
+    }
+    fn particle(&mut self, id: &str, at: [f64; 3], count: u32, spread: [f64; 3], speed: f64) {
+        use horizon_client::particles::{ParticleOptions, ParticleType};
+        let Some(ty) = ParticleType::from_name(id) else {
+            log::debug!("Fabric: no particle type {id}");
+            return;
+        };
+        let Some(lan) = self.0.lan.as_ref() else {
+            return;
+        };
+        super::lan_particles::send_hub_level_particles(
+            &lan.hub,
+            &ParticleOptions::simple(ty),
+            at,
+            spread,
+            speed,
+            count,
+            None,
+        );
+    }
 }
 
 impl Game<'_> {
@@ -366,13 +400,22 @@ impl Game<'_> {
         &mut self,
         pos: [i32; 3],
         face: [i32; 3],
+        hit: [f64; 3],
+        sneaking: bool,
+        off_hand: bool,
         canceled: &mut bool,
     ) {
         if *canceled {
             return;
         }
 
-        let event = hfc_runtime::bridge::RightClickBlockEvent { pos, face };
+        let event = hfc_runtime::bridge::RightClickBlockEvent {
+            pos,
+            face,
+            hit,
+            sneaking,
+            off_hand,
+        };
         if let Ok(mut bridge) = get_fabric_bridge().lock() {
             let mut adapter = HostBridgeAdapter(self);
             if bridge.right_click_block(&mut adapter, &event) == hfc_runtime::bridge::Flow::Cancel {
@@ -472,6 +515,60 @@ impl Game<'_> {
                         horizon_world::level::flags::UPDATE_ALL,
                     );
                 }
+            }
+        }
+    }
+
+    /// Run the mod block ticks Fabric block code scheduled
+    /// (`Level.scheduleTick`) that are due, on the server thread. Each runs the
+    /// block's own `tick` over the world around it; what it sets, schedules
+    /// and sends is applied through the host.
+    pub(super) fn tick_fabric_blocks(&mut self) {
+        if self.fabric_block_ticks.is_empty() {
+            return;
+        }
+        if self.serving.is_none() && self.options.dedicated.is_none() {
+            return;
+        }
+        let now = u64::from(self.ticks);
+        let dimension = self.dim.id().to_string();
+        let mut due = Vec::new();
+        let mut later = Vec::new();
+        for entry in std::mem::take(&mut self.fabric_block_ticks) {
+            // A schedule belongs to the level it was made in.
+            if entry.0 <= now && entry.1 == dimension {
+                due.push((entry.2, entry.3));
+            } else {
+                later.push(entry);
+            }
+        }
+        self.fabric_block_ticks = later;
+        if due.is_empty() {
+            return;
+        }
+        // At most 64 a tick: a block that reschedules itself every tick must
+        // not hold the frame; the rest run on the next tick.
+        if due.len() > 64 {
+            for (pos, block) in due.split_off(64) {
+                self.fabric_block_ticks
+                    .push((now + 1, dimension.clone(), pos, block));
+            }
+        }
+        let Some(bridge) = started_fabric_bridge() else {
+            return;
+        };
+        let Ok(mut bridge) = bridge.lock() else {
+            return;
+        };
+        for (pos, block) in due {
+            // The block may have been broken or replaced since it was
+            // scheduled: then its tick no longer applies.
+            if self.native_block(pos) != block {
+                continue;
+            }
+            let mut adapter = HostBridgeAdapter(self);
+            if let Some(effects) = bridge.tick_block(&adapter, pos, &block) {
+                bridge.apply_block_effects(&mut adapter, &effects);
             }
         }
     }

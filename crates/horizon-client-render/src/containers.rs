@@ -58,42 +58,31 @@ pub fn mod_menu_type(id: &str) -> Option<&'static ModMenuType> {
 /// A content mod block's declared container (`container` in a block's file).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclaredContainer {
-    /// Its slots and menu, with every slot open to every face, hopper
-    /// insertion and extraction, as `BaseContainerBlockEntity` is without
-    /// `WorldlyContainer`.
+    /// Its slots and menu, with the slots each face reaches, hopper insertion
+    /// and extraction, and the stack size its slots hold.
     pub container: ModContainer,
     /// The menu's title as a literal; the block's name when none.
     pub title: Option<String>,
+    /// The menu's title as a translation key (the mod's own lang files); used
+    /// before `title`.
+    pub title_key: Option<String>,
 }
 
 static BLOCK_CONTAINERS: std::sync::OnceLock<
     std::collections::HashMap<String, std::sync::Arc<DeclaredContainer>>,
 > = std::sync::OnceLock::new();
 
-/// registers the content mods' block containers, `(block, slots, menu,
-/// title)`, a list set once per process (false when it already was).
+/// registers the content mods' block containers, `(block, declaration)`, a
+/// list set once per process (false when it already was).
 pub fn register_block_containers(
-    blocks: impl IntoIterator<Item = (String, usize, String, Option<String>)>,
+    blocks: impl IntoIterator<Item = (String, DeclaredContainer)>,
 ) -> bool {
     if BLOCK_CONTAINERS.get().is_some() {
         return false;
     }
     let blocks = blocks
         .into_iter()
-        .map(|(block, slots, menu, title)| {
-            let all: Vec<usize> = (0..slots).collect();
-            let container = ModContainer {
-                slots,
-                faces: std::array::from_fn(|_| all.clone()),
-                inputs: all.clone(),
-                outputs: all,
-                menu: Some(menu),
-            };
-            (
-                block,
-                std::sync::Arc::new(DeclaredContainer { container, title }),
-            )
-        })
+        .map(|(block, declared)| (block, std::sync::Arc::new(declared)))
         .collect();
     BLOCK_CONTAINERS.set(blocks).is_ok()
 }
@@ -175,6 +164,26 @@ pub fn display_name(custom: Option<&str>, default_key: &str) -> horizon_world::n
         Some(name) => horizon_protocol::text::literal(name),
         None => horizon_protocol::text::translatable(default_key, &[]),
     }
+}
+
+/// `getDisplayName()` of a container a content mod declared: the block
+/// entity's custom name, else the decl's translation key, else its literal
+/// title, else the block's own name key.
+pub fn declared_name(
+    custom: Option<&str>,
+    declared: Option<&DeclaredContainer>,
+    default_key: &str,
+) -> horizon_world::nbt::Tag {
+    if let Some(name) = custom {
+        return horizon_protocol::text::literal(name);
+    }
+    if let Some(key) = declared.and_then(|d| d.title_key.as_deref()) {
+        return horizon_protocol::text::translatable(key, &[]);
+    }
+    if let Some(title) = declared.and_then(|d| d.title.as_deref()) {
+        return horizon_protocol::text::literal(title);
+    }
+    horizon_protocol::text::translatable(default_key, &[])
 }
 
 /// `ChestBlock.MENU_PROVIDER_COMBINER`'s `getDisplayName` for a double chest:

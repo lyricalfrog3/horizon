@@ -235,12 +235,29 @@ the mod's own [menu types](#menu-types) with the same `slots`. A mismatch is
 refused for a mod's own menu and, for a vanilla one, leaves the block a
 container that opens nothing (with a warning). `title` is a literal; without
 it the menu is titled by the block's name (`block.<id>.<path>`, from the
-lang files), as vanilla's default name is. Whatever the template, using the
-block opens the menu, the block entity is made when it is placed and its
-items are saved with the chunk. Breaking or replacing the block drops them, hoppers
-reach every slot from every side, and a comparator reads it as it reads a
-barrel. Not covered: a container's own `getMaxStackSize`, loot tables,
-ticking and per-slot rules; `native_block_entity_container` ([native-mods.md](native-mods.md))
+lang files), as vanilla's default name is. `title_key` names a translation
+key (the mod's own lang files translate it) and is preferred over `title`
+when both are set.
+
+Three more keys describe the block entity's own `Container` methods:
+
+- `max_stack_size` (1 to 99): `getMaxStackSize()`, how many of an item one
+  slot holds. Vanilla's 64 when unset. It caps the player's clicks and hopper
+  transfers into the block, as `Slot.getMaxStackSize` does.
+- `faces`: `WorldlyContainer.getSlotsForFace` for each face
+  (`"down"`, `"up"`, `"north"`, `"south"`, `"west"`, `"east"`), as lists of
+  container slots. Every slot from every face when unset; a hopper only
+  reaches the slots the matching face lists.
+- Nothing declares `canPlaceItem`, `canPlaceItemThroughFace` or
+  `canTakeItemThroughFace`: they depend on the stack, so the game cannot run
+  them. Every declared slot takes and gives anything the stack permits.
+
+Whatever the template, using the block opens the menu, the block entity is
+made when it is placed and its items are saved with the chunk. Breaking or
+replacing the block drops them, hoppers reach the slots `faces` gives them,
+and a comparator reads it as it reads a barrel. Not covered: a container's
+loot tables, ticking and the per-slot `canPlaceItem`/`canTakeItem` rules
+above; `native_block_entity_container` ([native-mods.md](native-mods.md))
 takes precedence when a native mod also declares one for the block.
 
 A mod's creative inventory tabs are `data/<ns>/horizon/creative_tab/*.json`:

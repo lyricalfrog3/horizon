@@ -6161,10 +6161,13 @@ impl Game<'_> {
         &mut self,
         pos: [i32; 3],
         face: [i32; 3],
+        hit: [f64; 3],
+        sneaking: bool,
+        off_hand: bool,
         canceled: &mut bool,
     ) {
         mod_api::dispatch_right_click_block(self, mod_api::mods(), pos, face, canceled);
-        self.fabric_right_click_block(pos, face, canceled);
+        self.fabric_right_click_block(pos, face, hit, sneaking, off_hand, canceled);
     }
     /// An explosion at `center` in `dimension` (`minecraft:overworld`) is
     /// about to break `blocks`: `ServerExplosion.explode` with its `toBlow`,

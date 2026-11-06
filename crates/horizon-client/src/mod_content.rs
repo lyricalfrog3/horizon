@@ -17,8 +17,8 @@
 use crate::{Result, blocks::MAP_COLORS};
 use horizon_core::geometry::{Aabb, Axis, ShapeOp, Vec3, VoxelShape};
 use horizon_mods::content::{
-    Block, BlockContainer, BlockShapes, Content, CreativeTab, EntityType, MenuType, MobEffect, Rarity,
-    StateProperty, TabEntries, TabPlacement,
+    Block, BlockContainer, BlockShapes, Content, CreativeTab, EntityType, MenuType, MobEffect,
+    Rarity, StateProperty, TabEntries, TabPlacement,
 };
 use horizon_world::nbt::{self, Compound, JavaString, Limits, Tag};
 use serde::{Deserialize, Serialize, de};
