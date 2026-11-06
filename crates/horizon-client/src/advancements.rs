@@ -1802,4 +1802,29 @@ mod tests {
         );
         assert_eq!(date_millis("not a date"), None);
     }
+
+    /// The prepared resources hold every vanilla root, which the server's
+    /// first packet has to carry for the client to show all tabs.
+    #[test]
+    fn prepared_advancements_load_the_vanilla_roots() {
+        let Some(root) = std::env::var_os("HORIZON_TEST_RESOURCES") else {
+            return;
+        };
+        let tree = Tree::load(&PathBuf::from(root).join("data"));
+        let roots: Vec<&str> = tree
+            .list
+            .iter()
+            .filter(|a| a.parent.is_none() && a.display.is_some())
+            .map(|a| a.id.as_str())
+            .collect();
+        for expected in [
+            "minecraft:story/root",
+            "minecraft:nether/root",
+            "minecraft:end/root",
+            "minecraft:adventure/root",
+            "minecraft:husbandry/root",
+        ] {
+            assert!(roots.contains(&expected), "{expected} in {roots:?}");
+        }
+    }
 }

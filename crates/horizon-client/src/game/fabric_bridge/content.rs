@@ -23,7 +23,8 @@
 mod blocks;
 
 use hfc_runtime::bridge::{
-    CreativeTabAddition, FabricModMetadata, RegisteredBlock, RegisteredItem, TabPlacement,
+    CreativeTabAddition, ExportedCreativeTab, FabricModMetadata, RegisteredBlock, RegisteredItem,
+    TabPlacement,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -36,13 +37,14 @@ const MAX_COPY: u64 = 256 << 20;
 /// `base` is the prepared resource root, whose vanilla block tables the
 /// blocks' templates are chosen from.
 pub(in super::super) fn fabric_content_mods(out: &Path, base: &Path) -> Vec<PathBuf> {
-    let (items, blocks, tabs, mods) = match super::get_fabric_bridge().lock() {
+    let (items, blocks, tabs, mod_tabs, mods) = match super::get_fabric_bridge().lock() {
         Ok(mut bridge) => {
             let blocks = registered_blocks(&mut bridge);
             (
                 bridge.registered_items(),
                 blocks,
                 bridge.creative_tab_additions(),
+                bridge.registered_creative_tabs(),
                 bridge.loaded_mods().to_vec(),
             )
         }
@@ -52,7 +54,11 @@ pub(in super::super) fn fabric_content_mods(out: &Path, base: &Path) -> Vec<Path
     let declared = declare_blocks(&blocks, base);
     let mut by_namespace: BTreeMap<
         String,
-        (Vec<RegisteredItem>, Vec<(String, serde_json::Value)>),
+        (
+            Vec<RegisteredItem>,
+            Vec<(String, serde_json::Value)>,
+            Vec<ExportedCreativeTab>,
+        ),
     > = BTreeMap::new();
     for item in items {
         if let Some((namespace, _)) = item.id.split_once(':') {
@@ -72,18 +78,27 @@ pub(in super::super) fn fabric_content_mods(out: &Path, base: &Path) -> Vec<Path
                 .push((id, json));
         }
     }
+    for tab in mod_tabs {
+        if let Some((namespace, _)) = tab.id.split_once(':') {
+            by_namespace
+                .entry(namespace.to_owned())
+                .or_default()
+                .2
+                .push(tab);
+        }
+    }
     let mut folders = Vec::new();
-    for (namespace, (items, blocks)) in by_namespace {
+    for (namespace, (items, blocks, mod_tabs)) in by_namespace {
         // The tab placements of this namespace's items, in the mod's order.
         let tabs: Vec<&CreativeTabAddition> = tabs
             .iter()
             .filter(|t| {
                 t.item
                     .split_once(':')
-                    .is_some_and(|(ns, _)| ns == namespace)
+                    .is_some_and(|(ns, _)| ns == namespace.as_str())
             })
             .collect();
-        match write_mod(out, &namespace, &items, &blocks, &tabs, &mods) {
+        match write_mod(out, &namespace, &items, &blocks, &mod_tabs, &tabs, &mods) {
             Ok(folder) => {
                 log::info!(
                     "Fabric: {} item(s) and {} block(s) registered in {namespace}: content mod {}",
@@ -302,11 +317,13 @@ fn owner<'a>(namespace: &str, mods: &'a [FabricModMetadata]) -> Option<&'a Fabri
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_mod(
     out: &Path,
     namespace: &str,
     items: &[RegisteredItem],
     blocks: &[(String, serde_json::Value)],
+    mod_tabs: &[ExportedCreativeTab],
     tabs: &[&CreativeTabAddition],
     mods: &[FabricModMetadata],
 ) -> Result<PathBuf, String> {
@@ -401,6 +418,23 @@ fn write_mod(
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let text = serde_json::to_vec_pretty(json).map_err(|e| e.to_string())?;
+        std::fs::write(&target, text).map_err(|e| e.to_string())?;
+    }
+    // A tab the mod built in code: its title, icon and generator's items.
+    for tab in mod_tabs {
+        let Some((_, path)) = tab.id.split_once(':') else {
+            continue;
+        };
+        let file = serde_json::json!({
+            "title": tab.title,
+            "icon": tab.icon,
+            "items": tab.items,
+        });
+        let target = folder.join(format!("data/{namespace}/horizon/creative_tab/{path}.json"));
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let text = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
         std::fs::write(&target, text).map_err(|e| e.to_string())?;
     }
     // One `tab_entries` file per tab, entries in the order the mod made them.

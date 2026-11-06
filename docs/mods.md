@@ -275,6 +275,10 @@ lang file's `itemGroup.<mod id>.<file name>` (`creative_tab/gems.json` →
 `itemGroup.ruby.gems`) translates any title. A mod's items join the search tab
 under their names.
 
+A Fabric mod that registers its own `CreativeModeTab` in code gets a file like this
+automatically: the runtime runs the tab's `displayItems` generator and writes its title,
+icon and items. A tab whose icon cannot be read uses its first item as the icon.
+
 A mod puts items into tabs that already exist, vanilla's or another mod's, with
 `data/<ns>/horizon/tab_entries/<name>.json` (`<ns>` any namespace the mod owns), as
 Fabric's `CreativeModeTabEvents.modifyOutputEvent` and NeoForge's `BuildCreativeModeTabContentsEvent` do:

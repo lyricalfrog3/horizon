@@ -191,19 +191,21 @@ impl Game<'_> {
             };
         };
         let tree = &c.tree;
-        // A server sends only what the player may see.
+        // A server's first packet carries the whole tree; the client shows
+        // every widget it received, as vanilla's tab does (the server decided
+        // which ones exist).
         let visible = if self.adv.positions.is_some() {
             vec![true; tree.list.len()]
         } else {
             tree.visible(&c.kids, |i| self.adv.progress.done(&tree.list[i]))
         };
-        // AdvancementTab.create: a displayed root with a background.
+        // AdvancementTab.create: a displayed root with a background. Visibility
+        // is the widgets' rule, not the tabs': vanilla shows every root's tab
+        // from the start, even before any of its advancements is visible.
         let mut tabs: Vec<usize> = (0..tree.list.len())
             .filter(|&i| {
                 let a = &tree.list[i];
-                a.parent.is_none()
-                    && visible[i]
-                    && a.display.as_ref().is_some_and(|d| d.background.is_some())
+                a.parent.is_none() && a.display.as_ref().is_some_and(|d| d.background.is_some())
             })
             .collect();
         tabs.sort_by_key(|&i| {

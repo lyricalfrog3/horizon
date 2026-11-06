@@ -1242,12 +1242,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hfc-fabric"
+version = "0.1.0"
+dependencies = [
+ "hfc-core",
+ "serde",
+ "serde_json",
+ "toml",
+ "zip",
+]
+
+[[package]]
 name = "hfc-runtime"
 version = "0.1.0"
 dependencies = [
  "cafebabe",
  "flate2",
  "hfc-core",
+ "hfc-fabric",
  "log",
  "regex",
  "serde",

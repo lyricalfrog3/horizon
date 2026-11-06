@@ -119,9 +119,9 @@ impl ServerAdvancements {
             }
         }
         let recipe_book_add = (!entries.is_empty()).then(|| book_add(entries, false));
-        // flushDirty: every advancement the player may see, and its progress.
-        let visible = self.tree.visible(&self.kids, |i| done[i]);
-        let shown: Vec<usize> = (0..self.tree.list.len()).filter(|i| visible[*i]).collect();
+        // The first packet carries the whole tree, as vanilla's does: the
+        // client builds every root's tab from it and applies visibility itself.
+        let shown: Vec<usize> = (0..self.tree.list.len()).collect();
         let mut w = Writer::new();
         w.bool(true); // the first packet resets the client's advancements
         w.varint(shown.len() as i32);
@@ -221,10 +221,21 @@ impl ServerAdvancements {
             .tree
             .visible(&self.kids, |i| progress.done(&self.tree.list[i]));
         let was = |i: usize| !first && visible[i];
-        let added: Vec<usize> = (0..n).filter(|&i| now[i] && !was(i)).collect();
-        let removed: Vec<usize> = (0..n).filter(|&i| !now[i] && was(i)).collect();
+        // The first packet is a reset that carries the whole tree, so the
+        // client can build every root's tab; later packets only carry the
+        // advancements that became visible or hidden.
+        let added: Vec<usize> = if first {
+            (0..n).collect()
+        } else {
+            (0..n).filter(|&i| now[i] && !was(i)).collect()
+        };
+        let removed: Vec<usize> = if first {
+            Vec::new()
+        } else {
+            (0..n).filter(|&i| !now[i] && was(i)).collect()
+        };
         let progressed: Vec<usize> = if first {
-            (0..n).filter(|&i| now[i]).collect()
+            (0..n).collect()
         } else {
             changed
                 .iter()
