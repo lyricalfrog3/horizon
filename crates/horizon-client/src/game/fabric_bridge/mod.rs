@@ -344,6 +344,30 @@ impl hfc_runtime::bridge::HostBridge for HostBridgeAdapter<'_, '_> {
         let _ = self.0.native_give(item, count);
         self.0.pop_resource(pos, ItemStack::new(item, count));
     }
+    fn remove_block(&mut self, pos: [i32; 3], drop: bool) -> bool {
+        if self.0.native_block(pos) == "minecraft:air" {
+            return false;
+        }
+        if drop {
+            BREAKING_FOR_MOD.store(true, Ordering::SeqCst);
+            let broken = self.0.break_block(pos).is_ok();
+            BREAKING_FOR_MOD.store(false, Ordering::SeqCst);
+            return broken;
+        }
+        let dimension = self.0.dim.id().to_string();
+        let Some(air) = self.0.pack.assets.registry.default_state("minecraft:air") else {
+            return false;
+        };
+        self.0.native_set_block(
+            &dimension,
+            pos,
+            air,
+            horizon_world::level::flags::UPDATE_ALL,
+        )
+    }
+    fn can_remove_blocks(&self) -> bool {
+        true
+    }
     fn schedule_block_tick(&mut self, pos: [i32; 3], block: &str, delay: u32) {
         // A block that reschedules itself forever must not grow the queue
         // without bound.
