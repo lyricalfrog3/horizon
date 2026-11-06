@@ -964,6 +964,12 @@ struct GameLevel<'w> {
     client_side: bool,
     /// Only the integrated or dedicated server dispatches native observations.
     native_authoritative: bool,
+    /// Mod block ticks the vanilla scheduler made due; run after the level's
+    /// own block ticks, with the whole `Game` in hand.
+    fabric_due_ticks: &'w mut Vec<(
+        horizon_core::position::BlockPos,
+        horizon_world::registry::BlockStateId,
+    )>,
     native_player: Option<u128>,
     /// `Level.isDebug`: `setBlock` changes nothing.
     debug: bool,
@@ -1348,6 +1354,11 @@ impl LevelAccess for GameLevel<'_> {
             self.native_tick_block(ticks, self.dimension, pos, *state, handled);
             if !*handled && self.world.revision != revision {
                 *state = self.block_state(pos);
+            }
+            // A block a Fabric mod registered in code ticks through the
+            // runtime, not vanilla's behaviour table.
+            if !*handled {
+                self.fabric_due_tick(pos, *state, handled);
             }
         }
     }
@@ -2699,6 +2710,12 @@ struct Game<'a> {
     win: Option<win::Win>,
     end: end::EndState,
     block_ticks: Ticks,
+    /// Mod block ticks the vanilla scheduler made due this game tick, run by
+    /// `tick_fabric_blocks` right after the level's own block ticks.
+    fabric_due_ticks: Vec<(
+        horizon_core::position::BlockPos,
+        horizon_world::registry::BlockStateId,
+    )>,
     tick_chunks: horizon_client::tick_chunk_membership::TickChunkMembership,
     tickets: horizon_client::ticket_levels::ChunkTickets,
     random_tick_sections: horizon_client::random_tick_sections::RandomTickSections,
@@ -2890,10 +2907,6 @@ struct Game<'a> {
     remote: Option<remote::Remote>,
     /// This world is open to the network (game/lan.rs).
     lan: Option<lan::LanHost>,
-    /// Mod block ticks Fabric block code scheduled (`Level.scheduleTick`):
-    /// the game tick they are due, the dimension, the position and the block
-    /// id. Run by `tick_fabric_blocks` on the server thread.
-    fabric_block_ticks: Vec<(u64, String, [i32; 3], String)>,
     /// Single player's server thread, which `remote` is connected to.
     integrated: Option<integrated::Integrated>,
     /// The shapes of the open world's levels, from its dimension types.
@@ -4405,6 +4418,7 @@ impl Game<'_> {
             lid_openers: &self.lid_openers,
             client_side: self.remote.is_some(),
             native_authoritative,
+            fabric_due_ticks: &mut self.fabric_due_ticks,
             native_player: self.lan_acting_uuid,
             debug: self.world_debug,
             native_sounds: &mut self.creatures.lan_sounds,
@@ -18692,6 +18706,7 @@ impl<'a> Game<'a> {
             win: None,
             end: Default::default(),
             block_ticks: Ticks::new(0),
+            fabric_due_ticks: Vec::new(),
             tick_chunks: Default::default(),
             tickets: Default::default(),
             random_tick_sections: Default::default(),
@@ -18814,7 +18829,6 @@ impl<'a> Game<'a> {
             entity_attachments: Default::default(),
             remote: None,
             lan: None,
-            fabric_block_ticks: Vec::new(),
             integrated: None,
             level_shapes: Default::default(),
             serving: None,

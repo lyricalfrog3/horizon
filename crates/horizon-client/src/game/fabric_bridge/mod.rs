@@ -3,9 +3,11 @@
 //! `mod.rs` owns the runtime singleton and mod loading; the submodules hold the
 //! GUI replay, menu widgets, texture upload and key numbering.
 
-use super::Game;
+use super::{Game, GameLevel};
 use horizon_client::items::ItemStack;
 use horizon_client::text::Text;
+use horizon_core::position::BlockPos;
+use horizon_core::ticks::{ScheduleResult, TickPriority};
 use horizon_world::level::PlacementContext;
 use horizon_world::registry::BlockStateId;
 use std::collections::BTreeSet;
@@ -369,16 +371,7 @@ impl hfc_runtime::bridge::HostBridge for HostBridgeAdapter<'_, '_> {
         true
     }
     fn schedule_block_tick(&mut self, pos: [i32; 3], block: &str, delay: u32) {
-        // A block that reschedules itself forever must not grow the queue
-        // without bound.
-        if self.0.fabric_block_ticks.len() >= 4096 {
-            return;
-        }
-        let due = u64::from(self.0.ticks) + u64::from(delay.max(1));
-        let dimension = self.0.dim.id().to_string();
-        self.0
-            .fabric_block_ticks
-            .push((due, dimension, pos, block.to_string()));
+        self.0.schedule_fabric_tick(pos, block, delay);
     }
     fn particle(&mut self, id: &str, at: [f64; 3], count: u32, spread: [f64; 3], speed: f64) {
         use horizon_client::particles::{ParticleOptions, ParticleType};
@@ -398,6 +391,37 @@ impl hfc_runtime::bridge::HostBridge for HostBridgeAdapter<'_, '_> {
             count,
             None,
         );
+    }
+}
+
+impl GameLevel<'_> {
+    /// A due scheduled tick of a block a Fabric mod registered in code. Native
+    /// mods had the first chance; queue it for the runtime and keep vanilla's
+    /// behaviour table from ticking it.
+    pub(super) fn fabric_due_tick(
+        &mut self,
+        pos: BlockPos,
+        state: BlockStateId,
+        handled: &mut bool,
+    ) {
+        let Some(name) = self
+            .registry
+            .state(state)
+            .map(|state| state.name.to_string())
+        else {
+            return;
+        };
+        let Some(bridge) = started_fabric_bridge() else {
+            return;
+        };
+        let registered = bridge
+            .lock()
+            .map(|bridge| bridge.is_registered_block(&name))
+            .unwrap_or(false);
+        if registered {
+            self.fabric_due_ticks.push((pos, state));
+            *handled = true;
+        }
     }
 }
 
@@ -543,40 +567,41 @@ impl Game<'_> {
         }
     }
 
-    /// Run the mod block ticks Fabric block code scheduled
-    /// (`Level.scheduleTick`) that are due, on the server thread. Each runs the
-    /// block's own `tick` over the world around it; what it sets, schedules
-    /// and sends is applied through the host.
+    /// Schedule a Fabric block's tick on the level's vanilla scheduler, which
+    /// saves it with the chunk, follows the dimension and deduplicates. A
+    /// position outside the loaded chunks is dropped, as vanilla does.
+    pub(super) fn schedule_fabric_tick(&mut self, pos: [i32; 3], block: &str, delay: u32) {
+        let Some(state) = self.pack.assets.registry.default_state(block) else {
+            log::warn!("Fabric: cannot schedule a tick of {block}: no such block");
+            return;
+        };
+        let behaviour = self.res.behaviours().block(state);
+        let at = BlockPos::new(pos[0], pos[1], pos[2]);
+        let time = self.world.game_time;
+        if self.block_ticks.schedule_block(
+            time,
+            at,
+            behaviour,
+            delay.max(1) as i32,
+            TickPriority::Normal,
+        ) == ScheduleResult::MissingChunk
+        {
+            log::debug!("Fabric: the tick of {block} at {pos:?} is outside the loaded chunks");
+        }
+    }
+
+    /// Run the mod block ticks the vanilla scheduler made due this game tick.
+    /// Each runs the block's own `tick` over the world around it; what it
+    /// sets, schedules and sends is applied through the host. Unlike vanilla,
+    /// at most 10 ms of Fabric ticks run in one game tick: a mod that
+    /// reschedules many blocks at once has the rest deferred one tick.
     pub(super) fn tick_fabric_blocks(&mut self) {
-        if self.fabric_block_ticks.is_empty() {
+        let due = std::mem::take(&mut self.fabric_due_ticks);
+        if due.is_empty() {
             return;
         }
         if self.serving.is_none() && self.options.dedicated.is_none() {
             return;
-        }
-        let now = u64::from(self.ticks);
-        let dimension = self.dim.id().to_string();
-        let mut due = Vec::new();
-        let mut later = Vec::new();
-        for entry in std::mem::take(&mut self.fabric_block_ticks) {
-            // A schedule belongs to the level it was made in.
-            if entry.0 <= now && entry.1 == dimension {
-                due.push((entry.2, entry.3));
-            } else {
-                later.push(entry);
-            }
-        }
-        self.fabric_block_ticks = later;
-        if due.is_empty() {
-            return;
-        }
-        // At most 64 a tick: a block that reschedules itself every tick must
-        // not hold the frame; the rest run on the next tick.
-        if due.len() > 64 {
-            for (pos, block) in due.split_off(64) {
-                self.fabric_block_ticks
-                    .push((now + 1, dimension.clone(), pos, block));
-            }
         }
         let Some(bridge) = started_fabric_bridge() else {
             return;
@@ -584,15 +609,41 @@ impl Game<'_> {
         let Ok(mut bridge) = bridge.lock() else {
             return;
         };
-        for (pos, block) in due {
-            // The block may have been broken or replaced since it was
+        let started = std::time::Instant::now();
+        let mut deferred = Vec::new();
+        for (index, (pos, state)) in due.into_iter().enumerate() {
+            if index > 0 && started.elapsed() > std::time::Duration::from_millis(10) {
+                deferred.push((pos, state));
+                continue;
+            }
+            let Some(block) = self
+                .pack
+                .assets
+                .registry
+                .state(state)
+                .map(|state| state.name.to_string())
+            else {
+                continue;
+            };
+            // The block may have been broken or replaced since the tick was
             // scheduled: then its tick no longer applies.
-            if self.native_block(pos) != block {
+            if self.native_block([pos.x, pos.y, pos.z]) != block {
                 continue;
             }
             let mut adapter = HostBridgeAdapter(self);
-            if let Some(effects) = bridge.tick_block(&adapter, pos, &block) {
+            if let Some(effects) = bridge.tick_block(&adapter, [pos.x, pos.y, pos.z], &block) {
                 bridge.apply_block_effects(&mut adapter, &effects);
+            }
+        }
+        for (pos, state) in deferred {
+            if let Some(block) = self
+                .pack
+                .assets
+                .registry
+                .state(state)
+                .map(|state| state.name.to_string())
+            {
+                self.schedule_fabric_tick([pos.x, pos.y, pos.z], &block, 1);
             }
         }
     }

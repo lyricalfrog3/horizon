@@ -7676,4 +7676,46 @@ mod tests {
             let _ = fs::remove_dir_all(&own);
         }
     }
+
+    /// A tick of a block a Fabric mod registered as content round-trips
+    /// through the chunk's `block_ticks` list: the saved `i` is the block's
+    /// name (the registry's names include content blocks), and the delay is
+    /// measured from the save's game time.
+    #[test]
+    fn a_content_block_tick_round_trips_through_the_saved_nbt() {
+        use horizon_core::ticks::{ChunkTicks, ScheduledTick};
+        let names = ["minecraft:stone", "example:content_block"];
+        let id_of = |name: &str| names.iter().position(|n| *n == name).map(|i| i as u32);
+        let block = TickTypeId(1);
+        let pos = BlockPos::new(37, 70, -5);
+        let mut ticks = ChunkTicks::default();
+        assert!(ticks.schedule(ScheduledTick {
+            kind: block,
+            pos,
+            trigger_tick: 1_000,
+            priority: TickPriority::Normal,
+            sub_tick_order: 4,
+        }));
+        let saved = ticks.pack(990);
+        assert_eq!(saved[0].delay, 10);
+        let tag = tick_list(&saved, |kind| {
+            names.get(kind as usize).map(|n| n.to_string())
+        });
+        // `read_ticks` only keeps ticks of the chunk they are asked for.
+        let read = read_ticks(Some(&tag), (pos.x >> 4, pos.z >> 4), id_of);
+        assert_eq!(
+            read,
+            [SavedTick {
+                kind: block,
+                pos,
+                delay: 10,
+                priority: TickPriority::Normal,
+            }]
+        );
+        let mut loaded = ChunkTicks::from_saved(read);
+        loaded.unpack(990);
+        let due = loaded.poll().expect("the saved tick is queued");
+        assert_eq!((due.kind, due.pos), (block, pos));
+        assert_eq!(due.trigger_tick, 1_000);
+    }
 }
