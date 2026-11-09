@@ -14,7 +14,7 @@ use horizon_core::{
 };
 use horizon_world::{
     block_landing::LandingEntityKind,
-    entity_fluid::{CurrentAccumulator, CurrentTarget},
+    entity_fluid::{CurrentAccumulator, CurrentTarget, ModFluidImmersion},
     fluid::{FluidKind, FluidState},
     fluid_flow::{FluidFlowWorld, flow_at},
     movement_restitution::{RestitutionInput, RestitutionWorld, restitute_movement},
@@ -72,6 +72,9 @@ pub struct Fluids {
     pub in_water: bool,
     pub in_lava: bool,
     pub eye_in_water: bool,
+    /// The mod fluid the mob is deepest in (`isInFluidType`): not water to the
+    /// game, but the mob moves in it as in water, with its numbers.
+    pub modded: Option<ModFluidImmersion>,
 }
 /// `FluidFlowWorld` over the mob's scene: the neighbours a flow vector reads.
 struct FlowScene<'a, 'w>(&'a MobWorld<'w>);
@@ -164,11 +167,15 @@ impl MobWorld<'_> {
                 (hi.z.ceil() as i32 - 1).max(ez),
             ],
         );
-        if !self
-            .world
-            .may_hold(cells.0, cells.1, |s| self.facts.get(s).fluid != Fluid::None)
-        {
+        if !self.world.may_hold(cells.0, cells.1, |s| {
+            self.facts.get(s).fluid != Fluid::None
+                || !self.fluid_tables.fluid(s).kind().is_vanilla()
+        }) {
             return out;
+        }
+        // A second pass over the box, only when a content root loaded mod fluids.
+        if horizon_world::fluid::mod_fluids_loaded() {
+            out.modded = self.mod_fluid(lo, hi, (ex, ez), eye_y);
         }
         for x in lo.x.floor() as i32..=(hi.x.ceil() as i32 - 1) {
             for y in lo.y.floor() as i32..=(hi.y.ceil() as i32 - 1) {
@@ -221,10 +228,69 @@ impl MobWorld<'_> {
         }
         out
     }
+    /// The mod fluid in a cell and its surface: a full block under the same
+    /// fluid, else its amount / 9 (`FluidState.getHeight`). A mod liquid block
+    /// holds its fluid only in the fluid table, not in the block facts.
+    fn mod_fluid_at(&self, x: i32, y: i32, z: i32) -> Option<(FluidKind, f64)> {
+        let state = self.fluid_tables.fluid(self.world.block(x, y, z));
+        if state.kind().is_vanilla() {
+            return None;
+        }
+        let fluid = state.kind().source();
+        let above = self.fluid_tables.fluid(self.world.block(x, y + 1, z));
+        let h = if above.kind().source() == fluid {
+            1.0
+        } else {
+            f64::from(state.amount()) / 9.0
+        };
+        Some((fluid, f64::from(y) + h))
+    }
+    /// The mod fluid deepest over the box (`lo`..`hi`), and whether the eye
+    /// (in column `eye`) is in it: a mod liquid block holds its fluid only in
+    /// the fluid table.
+    fn mod_fluid(
+        &self,
+        lo: Vec3,
+        hi: Vec3,
+        eye: (i32, i32),
+        eye_y: f64,
+    ) -> Option<ModFluidImmersion> {
+        let at = |x, y, z| self.mod_fluid_at(x, y, z);
+        let (y0, y1) = (lo.y.floor() as i32, hi.y.ceil() as i32 - 1);
+        let mut deepest: Option<ModFluidImmersion> = None;
+        for x in lo.x.floor() as i32..=(hi.x.ceil() as i32 - 1) {
+            for y in y0..=y1 {
+                for z in lo.z.floor() as i32..=(hi.z.ceil() as i32 - 1) {
+                    if let Some((fluid, top)) = at(x, y, z)
+                        && top >= lo.y
+                        && deepest.is_none_or(|m| top - lo.y > m.height)
+                    {
+                        deepest = Some(ModFluidImmersion {
+                            fluid,
+                            height: top - lo.y,
+                            eyes_inside: false,
+                        });
+                    }
+                }
+            }
+        }
+        let mut m = deepest?;
+        m.eyes_inside = (y0..=y1).any(|y| {
+            at(eye.0, y, eye.1).is_some_and(|(fluid, top)| {
+                fluid == m.fluid && top >= lo.y && eye_y >= f64::from(y) && eye_y <= top
+            })
+        });
+        Some(m)
+    }
     /// Entity.updateFluidHeightAndDoFluidPushing's currents over the deflated
     /// box: the flow of every water and lava block it touches, summed (a thin
-    /// fluid layer scales its flow down), as (water, lava).
-    fn fluid_currents(&self, bounds: Aabb) -> (CurrentAccumulator, CurrentAccumulator) {
+    /// fluid layer scales its flow down), as (water, lava); `modded` sums the
+    /// flow of that mod fluid instead.
+    fn fluid_currents(
+        &self,
+        bounds: Aabb,
+        modded: Option<FluidKind>,
+    ) -> (CurrentAccumulator, CurrentAccumulator) {
         let base_y = bounds.min_position().y;
         let b = bounds.deflate(Vec3::new(0.001, 0.001, 0.001));
         let (lo, hi) = (b.min_position(), b.max_position());
@@ -235,12 +301,27 @@ impl MobWorld<'_> {
                 for z in lo.z.floor() as i32..=(hi.z.ceil() as i32 - 1) {
                     let p = BlockPos::new(x, y, z);
                     let state = self.fluid_tables.fluid(self.world.block(x, y, z));
-                    let current = match state.kind() {
-                        FluidKind::Empty => continue,
-                        FluidKind::Water | FluidKind::FlowingWater => &mut water,
-                        FluidKind::Lava | FluidKind::FlowingLava => &mut lava,
+                    let kind = state.kind();
+                    let current = if modded.is_some_and(|m| kind.source() == m) {
+                        &mut water
+                    } else if modded.is_some() || !kind.is_vanilla() {
+                        continue;
+                    } else if kind.source() == FluidKind::Water {
+                        &mut water
+                    } else if kind.source() == FluidKind::Lava {
+                        &mut lava
+                    } else {
+                        continue;
                     };
-                    let surface = f64::from(y) + self.fluid_height(x, y, z).1;
+                    let modded_top = if kind.is_vanilla() {
+                        None
+                    } else {
+                        self.mod_fluid_at(x, y, z)
+                    };
+                    let surface = match modded_top {
+                        Some((_, top)) => top,
+                        None => f64::from(y) + self.fluid_height(x, y, z).1,
+                    };
                     if surface < lo.y {
                         continue;
                     }
@@ -407,6 +488,52 @@ impl Mob {
     pub fn eye_y(&self) -> f64 {
         self.position.y + self.eye_height()
     }
+    /// `LivingEntity.onClimbable` (`Spider.onClimbable`: the climbing flag):
+    /// the block it stands in is `#minecraft:climbable` (vines, ladders,
+    /// scaffolding...), or an open trapdoor over a ladder facing the same way
+    /// (`trapdoorUsableAsLadder`). A mob gliding (`isFallFlying`) through a
+    /// `#minecraft:can_glide_through` block (vines) is not on it: that test
+    /// comes first.
+    pub fn on_climbable(&self, w: &MobWorld) -> bool {
+        if self.kind.flags.climber {
+            return self.climbing;
+        }
+        let (x, y, z) = (
+            self.position.x.floor() as i32,
+            self.position.y.floor() as i32,
+            self.position.z.floor() as i32,
+        );
+        let state = w.world.block(x, y, z);
+        let facts = w.facts.get(state);
+        if self.extra.fall_flying && w.has_tag("minecraft:can_glide_through", &facts.name) {
+            return false;
+        }
+        if w.has_tag("minecraft:climbable", &facts.name) {
+            return true;
+        }
+        facts.has_class("TrapDoorBlock")
+            && w.prop(x, y, z, "open") == Some("true")
+            && w.block_name(x, y - 1, z) == "minecraft:ladder"
+            && w.prop(x, y - 1, z, "facing") == w.prop(x, y, z, "facing")
+    }
+    /// `LivingEntity.getScale`: the `minecraft:scale` the server sent on this
+    /// living entity (`extra.model_scale`, 0 when none came), through the
+    /// species' `sanitizeScale` override. Every box, eye height, seat and
+    /// shadow radius takes it.
+    pub fn model_scale(&self) -> f32 {
+        let scale = if self.extra.model_scale > 0.0 {
+            self.extra.model_scale
+        } else {
+            1.0
+        };
+        match self.species() {
+            // HappyGhast.sanitizeScale: min(scale, 1), it never grows.
+            super::Species::HappyGhast => scale.min(1.0),
+            // Shulker.sanitizeScale: min(scale, 3).
+            super::Species::Shulker => scale.min(3.0),
+            _ => scale,
+        }
+    }
     /// Entity dimensions: the type's, a class's BABY_DIMENSIONS, or the
     /// slime size scaling.
     /// `EntityDimensions` (float width, height and eye height) widened to double.
@@ -427,15 +554,12 @@ impl Mob {
     /// `Pose.LONG_JUMPING` (what `LongJumpUtil` checks an arc with).
     pub fn awake_dims_in(&self, long_jumping: bool) -> (f64, f64, f64) {
         let k = &self.kind;
-        // Avatar.POSES: a player's or mannequin's box follows its pose, and
-        // LivingEntity.getDimensions scales it by `minecraft:scale`
-        // (`getScale`): a fake player's giant NPC is clickable on its body.
+        // `LivingEntity.getDimensions` is `getDefaultDimensions(pose).scale(
+        // getScale())` on every living entity: the species' box (a player's or
+        // mannequin's follows its pose, Avatar.POSES) times its
+        // `minecraft:scale` (`getScale`), width, height and eye height alike.
+        let scale = self.model_scale();
         if matches!(&*k.id, "minecraft:player" | "minecraft:mannequin") {
-            let scale = if self.extra.model_scale > 0.0 {
-                self.extra.model_scale
-            } else {
-                1.0
-            };
             let d = self.extra.avatar_pose.dimensions(scale);
             return (
                 f64::from(d.width),
@@ -484,10 +608,45 @@ impl Mob {
             let s = self.extra.size as f32;
             (w, h, e) = (w * s, h * s, e * s);
         }
-        (f64::from(w), f64::from(h), f64::from(e))
+        // Shulker.getDefaultDimensions: the last scale, over everything
+        // above, is the lid opening upward on a shell attached to the floor.
+        if k.species == super::Species::Shulker
+            && let Some(s) = super::shulker::peek_height_scale(self)
+        {
+            (h, e) = (h * s, e * s);
+        }
+        // Salmon.getDefaultDimensions: the variant's bounding box scale (small
+        // 0.5, medium 1.0, large 1.5) over the whole fish box.
+        if k.species == super::Species::Salmon {
+            let s = super::aquatic::salmon_scale(self.extra.variant);
+            (w, h, e) = (w * s, h * s, e * s);
+        }
+        // PolarBear.getDefaultDimensions: the rear-up animation scales the box
+        // by (1, 1 + clientSideStandAnimation / 6), so a bear at full height is
+        // twice as tall, with its eyes twice as high and the same width.
+        if k.species == super::Species::PolarBear {
+            let f = super::polar_bear::stand_box_scale(self);
+            (h, e) = (h * f, e * f);
+        }
+        // `EntityDimensions.scale(getScale())`: width and height by the scale,
+        // the eye height by its height factor (the same one).
+        (
+            f64::from(w * scale),
+            f64::from(h * scale),
+            f64::from(e * scale),
+        )
     }
     pub fn eye_height(&self) -> f64 {
         self.dims().2
+    }
+    /// `EntityRenderer.getPackedLightCoords` reads the block
+    /// `Entity.getLightProbePosition(partialTick)` is in, and a living entity
+    /// leaves that as `getEyePosition`: the eye height over
+    /// `getPosition(partialTick)`, the position the frame draws, not this
+    /// tick's. A mob walking across a cell boundary is drawn lit by the cell it
+    /// is drawn in.
+    pub fn light_probe(&self, partial: f64) -> [i32; 3] {
+        eye_probe_cell(self.previous, self.position, self.eye_height(), partial)
     }
     pub fn width(&self) -> f32 {
         self.dims().0 as f32
@@ -495,8 +654,13 @@ impl Mob {
     pub fn height(&self) -> f32 {
         self.dims().1 as f32
     }
+    /// `AgeableMob.isBaby`: `canBeABaby() && getAge() < 0`. The age alone is
+    /// not enough — a frog, a parrot, a zombie nautilus, a camel husk, a slime,
+    /// a magma cube, a piglin brute, a tadpole, or anything that is not an
+    /// `AgeableMob` at all is an adult whatever `Age` says, so its box, voice,
+    /// breeding, growth, drops and goals stay an adult's.
     pub fn is_baby(&self) -> bool {
-        self.extra.age < 0
+        self.extra.age < 0 && super::species::can_be_a_baby(self.kind.species)
     }
     pub fn fluid_jump_threshold(&self) -> f64 {
         // Breeze.getFluidJumpThreshold: its eye height.
@@ -507,6 +671,32 @@ impl Mob {
     }
     pub fn is_in_liquid(&self) -> bool {
         self.fluids.in_water || self.fluids.in_lava
+    }
+    /// The mod fluid the mob is in when it `canSwim`: it rises and floats in it.
+    pub fn swim_fluid(&self) -> Option<ModFluidImmersion> {
+        self.fluids
+            .modded
+            .filter(|m| m.fluid.info().entity.can_swim)
+    }
+    /// In a mod fluid that `canExtinguish`.
+    pub fn in_extinguishing_fluid(&self) -> bool {
+        self.fluids
+            .modded
+            .is_some_and(|m| m.fluid.info().entity.can_extinguish)
+    }
+    /// The eyes in a mod fluid that `canDrown`.
+    pub fn eye_in_drowning_fluid(&self) -> bool {
+        self.fluids
+            .modded
+            .is_some_and(|m| m.eyes_inside && m.fluid.info().entity.can_drown)
+    }
+    /// `FloatGoal.canUse` / the brains' `Swim`: deeper than the jump threshold
+    /// in water or a mod fluid that `canSwim`, or in lava.
+    pub fn floats(&self) -> bool {
+        let threshold = self.fluid_jump_threshold();
+        self.fluids.water > threshold
+            || self.fluids.in_lava
+            || self.swim_fluid().is_some_and(|m| m.height > threshold)
     }
     /// `Entity.isPushedByFluid`: water animals, turtles, axolotls, frogs and
     /// nautiluses keep their own course.
@@ -570,6 +760,40 @@ impl Mob {
     }
     /// Entity.move with block collisions and step-up; updates collision flags
     /// and fall distance (Entity.checkFallDamage).
+    /// `EntityGetter.getEntityCollisions(this, box.expandTowards(movement))`:
+    /// the boxes of the mobs whose `canBeCollidedWith(this)` holds (a living
+    /// shulker, a happy ghast held still), but not this mob's vehicle or a
+    /// fellow passenger (`Entity.canCollideWith`).
+    fn entity_collisions(&self, w: &MobWorld, movement: Vec3) -> Vec<Aabb> {
+        let area = self.bounds().expand_towards(movement);
+        if area.average_size() < 1.0e-7 {
+            return Vec::new();
+        }
+        let area = area.inflate(Vec3::new(1.0e-7, 1.0e-7, 1.0e-7));
+        let mover = self.species();
+        let blocks = |s: &&super::Seen| {
+            s.id != self.id
+                && s.blocks_mob(mover)
+                && s.bounds.intersects(area)
+                && !self.passenger_of_same_vehicle(s.id, s.vehicle)
+        };
+        match w.others_solid {
+            Some(slots) => slots
+                .iter()
+                .map(|&i| &w.others[i as usize])
+                .filter(blocks)
+                .map(|s| s.bounds)
+                .collect(),
+            None => w.others.iter().filter(blocks).map(|s| s.bounds).collect(),
+        }
+    }
+    /// `Entity.isPassengerOfSameVehicle` toward the entity `id` riding
+    /// `vehicle`: one rides the other, or both ride the same one.
+    fn passenger_of_same_vehicle(&self, id: u32, vehicle: Option<u32>) -> bool {
+        self.extra.mount == Some(id)
+            || vehicle == Some(self.id)
+            || (self.extra.mount.is_some() && vehicle == self.extra.mount)
+    }
     pub fn do_move(&mut self, w: &MobWorld, events: &mut Vec<MobEvent>) {
         let mut wanted = self.velocity;
         // Entity.move: a block the mob is stuck in (sweet berry bush) scales
@@ -589,14 +813,29 @@ impl Mob {
                 ..Default::default()
             }),
         };
-        // Entity.collide: the world border's walls stop the mob too.
+        // Entity.collide: the world border's walls stop the mob too, and so
+        // do the entities it may not pass through.
         let border = w.border.map(|b| (b, [self.position.x, self.position.z]));
+        let entities = self.entity_collisions(w, wanted);
         let moved = scene
-            .resolve_in_border(self.bounds(), wanted, step, self.on_ground, border)
+            .resolve_in_border_with(
+                self.bounds(),
+                wanted,
+                step,
+                self.on_ground,
+                border,
+                &entities,
+            )
             .unwrap_or(Vec3::ZERO);
         let length = moved.x * moved.x + moved.y * moved.y + moved.z * moved.z;
         let wanted_length = wanted.x * wanted.x + wanted.y * wanted.y + wanted.z * wanted.z;
         if length > 1.0e-7 || wanted_length - length < 1.0e-7 {
+            // A move of a block or more through water or a reset block (a
+            // vine, a ladder) resets the fall before the move's drop counts.
+            if self.fall_distance != 0.0 && length >= 1.0 && fall_reset_hit(w, self.position, moved)
+            {
+                self.fall_distance = 0.0;
+            }
             self.position = Vec3::new(
                 self.position.x + moved.x,
                 self.position.y + moved.y,
@@ -614,13 +853,10 @@ impl Mob {
         let vertical = wanted.y != moved.y;
         self.vertical_collision_below = vertical && wanted.y < 0.0;
         self.on_ground = self.vertical_collision_below;
-        // Strider.checkFallDamage: lava breaks any fall, and the fluid state
-        // waits for the next baseTick; Bat and Bee.checkFallDamage do nothing.
-        if self.kind.flags.lava_walker && self.fluids.in_lava {
-            self.fall_distance = 0.0;
-        } else if !matches!(self.kind.species, super::Species::Bat | super::Species::Bee) {
-            self.check_fall_damage(w, moved, events);
-        }
+        // Entity.setOnGroundWithMovement's checkSupportingBlock, before
+        // checkFallDamage reads the landing block (getOnPosLegacy).
+        self.supporting = self.supporting_block(w, moved);
+        self.species_check_fall_damage(w, moved, events);
         // Entity.restituteMovementAfterCollisions: the colliding components
         // bounce back by the entity's bounciness or the block's (a slime
         // block, a bed), whichever is larger. A mob never sneaks, so nothing
@@ -652,11 +888,27 @@ impl Mob {
                 input,
             );
         }
-        // Entity.checkSupportingBlock
-        self.supporting = self.supporting_block(w, moved);
         self.movement_emission(w, moved, events);
-        // Entity.applyEffectsFromBlocks: bubble columns push the mob, and the
-        // server shows the surface of one it is at the top of.
+        // Entity.move's last step: soul sand, honey and the like slow the
+        // horizontal speed of whatever the mob stands in or on.
+        let factor = self.block_speed_factor(w);
+        self.velocity = horizon_world::entity_move::scale_by_block_speed(self.velocity, factor);
+    }
+    /// `Entity.getBlockSpeedFactor` at the mob's feet.
+    fn block_speed_factor(&self, w: &MobWorld) -> f32 {
+        crate::motion::block_speed_factor_at(
+            w.world,
+            w.movement,
+            self.position,
+            self.supporting.map(|[x, y, z]| BlockPos::new(x, y, z)),
+        )
+    }
+    /// `Entity.applyEffectsFromBlocks` as `LivingEntity.aiStep` runs it, after
+    /// `travel` has moved the mob and applied the drag of its fluid (not inside
+    /// `Entity.move`): bubble columns push the mob, so the push is not slowed
+    /// by that tick's drag, and the server shows the surface of one it is at the
+    /// top of.
+    pub fn apply_effects_from_blocks(&mut self, w: &MobWorld, events: &mut Vec<MobEvent>) {
         let mut tops = Vec::new();
         if crate::motion::bubble_column_push_over(
             w.world,
@@ -674,6 +926,30 @@ impl Mob {
                 pos: [pos.x, pos.y, pos.z],
             });
         }
+    }
+    /// `checkFallDamage` as the species has it: Strider's lava breaks any fall
+    /// (the fluid state waits for the next baseTick); Bat's and Bee's do nothing.
+    fn species_check_fall_damage(&mut self, w: &MobWorld, moved: Vec3, events: &mut Vec<MobEvent>) {
+        if self.kind.flags.lava_walker && self.fluids.in_lava {
+            self.fall_distance = 0.0;
+        } else if !matches!(self.kind.species, super::Species::Bat | super::Species::Bee) {
+            self.check_fall_damage(w, moved, events);
+        }
+    }
+    /// `handleMoveVehicle` for a mount its rider's client moves, after the move:
+    /// `setOnGroundWithMovement` with the client's ground (`checkSupportingBlock`),
+    /// then `doCheckFallDamage` with the client's move `delta`. The server's
+    /// `Entity.move` counted no fall: it isn't the mount's authority.
+    pub fn client_moved_fall(
+        &mut self,
+        w: &MobWorld,
+        delta: Vec3,
+        on_ground: bool,
+        events: &mut Vec<MobEvent>,
+    ) {
+        self.on_ground = on_ground;
+        self.supporting = self.supporting_block(w, delta);
+        self.species_check_fall_damage(w, delta, events);
     }
     /// LivingEntity.checkFallDamage: the fluid state refreshed out of water
     /// (touching water resets the fall), then Entity.checkFallDamage.
@@ -709,6 +985,8 @@ impl Mob {
             state,
             at: [at.x, at.y, at.z],
             count,
+            // `sendParticles(..., 0.15)`: the crumbs fly up a little.
+            speed: f64::from(0.15_f32),
         });
     }
     /// Entity.updateFluidInteraction: the fluid state, then touching water
@@ -718,8 +996,8 @@ impl Mob {
         self.fluids = w.fluids(self.bounds(), self.eye_y());
         // EntityFluidInteraction.applyCurrentTo: the flow pushes the mob.
         if (self.fluids.in_water || self.fluids.in_lava) && self.pushed_by_fluid() {
-            let (water, lava) = w.fluid_currents(self.bounds());
-            let lava_scale = if w.nether {
+            let (water, lava) = w.fluid_currents(self.bounds(), None);
+            let lava_scale = if w.dimension_type.fast_lava {
                 0.007
             } else {
                 0.0023333333333333335
@@ -731,6 +1009,16 @@ impl Mob {
             if lava.height > 0.0 {
                 let _ = lava.apply_to(&mut pushed, lava_scale);
             }
+        }
+        // A mod fluid pushes by its `motionScale` when it `canPushEntity`, and
+        // scales the fall distance by its `fallDistanceModifier`.
+        if let Some(m) = self.fluids.modded {
+            let numbers = m.fluid.info().entity;
+            if numbers.can_push && self.pushed_by_fluid() {
+                let (current, _) = w.fluid_currents(self.bounds(), Some(m.fluid));
+                let _ = current.apply_to(&mut Pushed(&mut self.velocity), numbers.motion_scale);
+            }
+            self.fall_distance *= f64::from(numbers.fall_distance_modifier);
         }
         if self.fluids.in_water {
             self.fall_distance = 0.0;
@@ -768,12 +1056,17 @@ impl Mob {
                 && (self.on_ground || climbable)
                 && !self.fluids_swimming();
             if produced {
+                // `getMovementEmission().emitsSounds()`: the footfall is played
+                // only for a type whose emission is `ALL`, while the step game
+                // event below is sent by `EVENTS` types too.
+                let heard = super::ai::movement_sounds(self);
                 if super::equine::hoof_steps(self.species()) {
-                    if !self.silent {
+                    if heard && !self.silent {
                         super::equine::play_step(self, w, legacy, legacy_state, events);
                     }
                 } else if let Some((sound, volume, pitch)) =
                     super::ai::step_sound(self, w, legacy, legacy_state)
+                    && heard
                     && !self.silent
                 {
                     let at = [self.position.x, self.position.y, self.position.z];
@@ -823,9 +1116,22 @@ impl Mob {
                 source: self.id,
                 state: horizon_world::registry::BlockStateId(0),
             });
-        } else if w.facts.is_air(state) && self.species() == super::Species::Parrot {
-            // Entity.processFlappingMovement: a move ending in the air.
-            super::parrot::process_flapping(self, events);
+        } else if w.facts.is_air(state) {
+            // Entity.processFlappingMovement: onFlap runs before the game
+            // event. Silent birds still emit it, independently of sound.
+            let flapped = match self.species() {
+                super::Species::Chicken => super::farm::chicken_process_flapping(self),
+                super::Species::Parrot => super::parrot::process_flapping(self, events),
+                _ => false,
+            };
+            if flapped {
+                events.push(MobEvent::GameEvent {
+                    event: "minecraft:flap",
+                    at: [self.position.x, self.position.y, self.position.z],
+                    source: self.id,
+                    state: horizon_world::registry::BlockStateId(0),
+                });
+            }
         }
     }
     /// `Entity.nextStep`: the next whole metre walked; a warden's steps come
@@ -1011,7 +1317,7 @@ impl Mob {
         // Creeper.causeFallDamage: the fall swells the fuse, up to five ticks
         // short of exploding.
         if self.species() == super::Species::Creeper {
-            self.swell = (self.swell + (distance * 1.5) as i32).min(30 - 5);
+            self.swell = (self.swell + (distance * 1.5) as i32).min(self.max_swell - 5);
         }
         // AbstractHorse.causeFallDamage (llamas override it): a landing of more
         // than a block thuds, and the horse's fall makes no generic fall sound.
@@ -1068,10 +1374,11 @@ impl Mob {
             self.fall_to_passengers(distance, modifier, events);
         }
         if damage > 0.0 {
-            // Llama.causeFallDamage: only a fall of six blocks or more hurts the
-            // llama and its riders.
+            // Llama.causeFallDamage: shorter damaging falls play the block
+            // sound but do not hurt the llama or its riders.
             if super::llama::is_llama(self.species()) && distance < 6.0 {
-                return false;
+                self.block_fall_sound(contact, events);
+                return true;
             }
             let at = [self.position.x, self.position.y, self.position.z];
             // Monster.getFallSounds: the hostile pair.
@@ -1085,14 +1392,38 @@ impl Mob {
             // Horses thud and llamas make no generic fall sound.
             if !horse {
                 events.push(MobEvent::Sound(sound, at, 1.0, 1.0));
+                self.block_fall_sound(contact, events);
             }
             self.damage(damage as f32, super::Damage::of(source));
             if horse {
                 self.fall_to_passengers(distance, modifier, events);
+                self.block_fall_sound(contact, events);
             }
             return true;
         }
         false
+    }
+    /// `LivingEntity.playBlockFallSound`: the block 0.2 below the feet plays
+    /// its fall sound at half its volume and three quarters of its pitch,
+    /// unless the mob is silent or the block is air.
+    fn block_fall_sound(&self, contact: Option<(&MobWorld, [i32; 3])>, events: &mut Vec<MobEvent>) {
+        if self.silent {
+            return;
+        }
+        if let Some((w, _)) = contact {
+            let pos = self.on_pos(0.2);
+            let state = w.world.block(pos[0], pos[1], pos[2]);
+            if !w.facts.is_air(state) {
+                let sounds = &w.facts.get(state).sounds;
+                let at = [self.position.x, self.position.y, self.position.z];
+                events.push(MobEvent::SoundId(
+                    sounds.fall.to_string(),
+                    at,
+                    sounds.volume * 0.5,
+                    sounds.pitch * 0.75,
+                ));
+            }
+        }
     }
     /// `Entity.propagateFallToPassengers`: the game gives the fall to each
     /// passenger (`causeFallDamage`), a mob or a player, for this mob is
@@ -1118,8 +1449,15 @@ impl Mob {
             self.flying_speed()
         }
     }
+    /// `LivingEntity.getFlyingSpeed`: a mount its player steers
+    /// (`getControllingPassenger() instanceof Player`) keeps a tenth of its
+    /// speed in the air (a horse's jump); anything else 0.02.
     fn flying_speed(&self) -> f32 {
-        0.02
+        if super::equine::controlled(self) {
+            self.ai.speed * 0.1
+        } else {
+            0.02
+        }
     }
     /// `LivingEntity.getEffectiveGravity`: the gravity, floored to 0.01 while a
     /// Slow Falling mob is on its way down.
@@ -1155,10 +1493,54 @@ impl Mob {
             self.position.z.floor() as i32,
         );
         let stands_on_fluid = self.kind.flags.lava_walker && w.fluid(x, y, z) == Fluid::Lava;
-        if self.is_in_liquid() && self.affected_by_fluids() && !stands_on_fluid {
+        let in_fluid = self.is_in_liquid() || self.fluids.modded.is_some();
+        if in_fluid && self.affected_by_fluids() && !stands_on_fluid {
             self.travel_in_fluid(w, input, events);
+        } else if self.extra.fall_flying {
+            self.travel_fall_flying(w, input, events);
         } else {
             self.travel_in_air(w, input, events);
+        }
+    }
+    /// `LivingEntity.travelFallFlying`: use the mob's existing authoritative move
+    /// and damage routes, with the shared `updateFallFlyingMovement` arithmetic.
+    fn travel_fall_flying(&mut self, w: &MobWorld, input: Vec3, events: &mut Vec<MobEvent>) {
+        if self.on_climbable(w) {
+            self.travel_in_air(w, input, events);
+            self.extra.fall_flying = false;
+            return;
+        }
+        let before = (self.velocity.x * self.velocity.x + self.velocity.z * self.velocity.z).sqrt();
+        self.velocity = crate::motion::fall_flying_movement(
+            self.velocity,
+            self.head_pitch,
+            self.yaw,
+            self.effective_gravity(),
+        );
+        self.do_move(w, events);
+        if self.horizontal_collision {
+            let damage = ((before
+                - (self.velocity.x * self.velocity.x + self.velocity.z * self.velocity.z).sqrt())
+                * 10.0
+                - 3.0) as f32;
+            if damage > 0.0 {
+                let monster = super::ai::is_monster(self.species());
+                let sound = match (monster, damage as i32 > 4) {
+                    (true, true) => "entity.hostile.big_fall",
+                    (true, false) => "entity.hostile.small_fall",
+                    (false, true) => "entity.generic.big_fall",
+                    (false, false) => "entity.generic.small_fall",
+                };
+                if !self.silent {
+                    events.push(MobEvent::Sound(
+                        sound,
+                        [self.position.x, self.position.y, self.position.z],
+                        1.0,
+                        1.0,
+                    ));
+                }
+                self.damage(damage, super::Damage::of(super::DamageKind::FlyIntoWall));
+            }
         }
     }
     /// LivingEntity.travelFlying: no gravity, `0.91F` drag in the air,
@@ -1234,6 +1616,15 @@ impl Mob {
     fn air_drag_modifier(&self) -> f32 {
         super::sulfur_cube::physics(self).map_or(1.0, |a| a.air_drag_modifier.clamp(0.0, 2048.0))
     }
+    /// `LivingEntity.handleOnClimbable` for a mob, which is never a `Player`
+    /// that holds still on a ladder: the move across clamped to 0.15 either
+    /// way and the fall to 0.15, both the float 0.15F (`Mth.clamp`,
+    /// `Math.max`, which keep a NaN).
+    fn climbable_velocity(v: Vec3) -> Vec3 {
+        let limit = f64::from(0.15f32);
+        let y = if v.y.is_nan() { v.y } else { v.y.max(-limit) };
+        Vec3::new(v.x.clamp(-limit, limit), y, v.z.clamp(-limit, limit))
+    }
     fn travel_in_air(&mut self, w: &MobWorld, input: Vec3, events: &mut Vec<MobEvent>) {
         let friction = if self.on_ground {
             // FRICTION_MODIFIER scales the block's slipperiness.
@@ -1245,21 +1636,15 @@ impl Mob {
         };
         let speed = self.friction_speed(friction);
         self.move_relative(speed, input);
-        if self.kind.flags.climber && self.horizontal_collision {
-            // Spider.onClimbable: handleOnClimbable clamps and resets the fall.
+        // LivingEntity.handleRelativeFrictionAndCalculateMovement:
+        // handleOnClimbable, the move, then the climb up a wall.
+        if self.on_climbable(w) {
             self.fall_distance = 0.0;
-            self.velocity = Vec3::new(
-                self.velocity.x.clamp(-0.15, 0.15),
-                self.velocity.y.max(-0.15),
-                self.velocity.z.clamp(-0.15, 0.15),
-            );
+            self.velocity = Self::climbable_velocity(self.velocity);
         }
         self.do_move(w, events);
         let mut movement = self.velocity;
-        if self.kind.flags.climber
-            && (self.horizontal_collision || self.ai.jumping)
-            && self.climbing
-        {
+        if (self.horizontal_collision || self.ai.jumping) && self.on_climbable(w) {
             movement.y = 0.2;
         }
         let mut y = movement.y;
@@ -1272,11 +1657,6 @@ impl Mob {
         {
             y += (0.05 * f64::from(amp + 1) - movement.y) * 0.2;
         } else {
-            // LivingEntity.travelInAir: a Slow Falling mob on its way down lands without
-            // having fallen.
-            if self.velocity.y <= 0.0 && self.has_effect("minecraft:slow_falling") {
-                self.fall_distance = 0.0;
-            }
             y -= self.effective_gravity();
         }
         // LivingEntity.shouldDiscardFriction (a breeze's, a frog's or a goat's
@@ -1306,7 +1686,9 @@ impl Mob {
         let falling = self.velocity.y <= 0.0;
         let old_y = self.position.y;
         let gravity = self.effective_gravity();
-        if self.fluids.in_water {
+        // A mod fluid moves the mob as water (NeoForge's `FluidType.move` left
+        // to the default).
+        if self.fluids.in_water || !self.fluids.in_lava && self.fluids.modded.is_some() {
             let mut slow = if self.extra.sprinting {
                 0.9
             } else {
@@ -1324,7 +1706,9 @@ impl Mob {
             self.move_relative(speed, input);
             self.do_move(w, events);
             let mut m = self.velocity;
-            if self.horizontal_collision && self.kind.flags.climber {
+            // LivingEntity.travelInWater: `horizontalCollision && onClimbable()`,
+            // a ladder or scaffolding under water as well as a climbing spider.
+            if self.horizontal_collision && self.on_climbable(w) {
                 m.y = 0.2;
             }
             m = Vec3::new(
@@ -1392,13 +1776,13 @@ impl Mob {
     /// The jump part of LivingEntity.aiStep.
     pub fn handle_jumping(&mut self, w: &MobWorld) {
         if self.ai.jumping && self.affected_by_fluids() {
+            // `jumpInFluid` also rises in a mod fluid that `canSwim`.
+            let swim = self.swim_fluid().map_or(0.0, |m| m.height);
             let (fluid_height, in_water_with_height) = if self.fluids.in_lava {
                 (self.fluids.lava, false)
             } else {
-                (
-                    self.fluids.water,
-                    self.fluids.in_water && self.fluids.water > 0.0,
-                )
+                let height = self.fluids.water.max(swim);
+                (height, (self.fluids.in_water || swim > 0.0) && height > 0.0)
             };
             let threshold = self.fluid_jump_threshold();
             if !in_water_with_height || self.on_ground && fluid_height <= threshold {
@@ -1450,11 +1834,11 @@ impl Mob {
             self.species(),
             super::Species::Slime | super::Species::MagmaCube | super::Species::SulfurCube
         ) {
-            super::cube::jump(self);
+            super::cube::jump(self, w);
             crate::motion::native_living_jump(self.id, &self.kind.id);
             return;
         }
-        let power = self.jump_power();
+        let power = self.jump_power(w);
         if power > 1.0e-5 {
             self.velocity.y = f64::from(power).max(self.velocity.y);
             // A sprint jump (a dashing cat or ocelot) adds 0.2 along its yaw.
@@ -1464,10 +1848,51 @@ impl Mob {
                 self.velocity.z += f64::from(trig::cos(angle)) * 0.2;
             }
         }
+        // Sniffer.jumpFromGround: a hop the move control asked for, taken from
+        // nearly standing still, carries a tenth of a block forward.
+        if self.species() == super::Species::Sniffer
+            && self.ai.mov.speed_modifier > 0.0
+            && self.velocity.horizontal_distance_squared() < 0.01
+        {
+            self.move_relative(0.1, Vec3::new(0.0, 0.0, 1.0));
+        }
         crate::motion::native_living_jump(self.id, &self.kind.id);
     }
-    pub fn jump_power(&self) -> f32 {
-        self.kind.jump_strength as f32
+    /// `LivingEntity.getJumpPower`: the jump power with a multiplier of 1.0.
+    pub fn jump_power(&self, w: &MobWorld) -> f32 {
+        self.jump_power_with(w, 1.0)
+    }
+    /// `LivingEntity.getJumpPower(float multiplier)`
+    pub fn jump_power_with(&self, w: &MobWorld, multiplier: f32) -> f32 {
+        self.attrs.jump_strength as f32 * multiplier * self.block_jump_factor(w)
+            + self.jump_boost_power()
+    }
+    /// `LivingEntity.getJumpBoostPower`: amplifier + 1 times 0.1, or 0.0 without the effect.
+    pub fn jump_boost_power(&self) -> f32 {
+        self.extra
+            .effects
+            .iter()
+            .find(|e| e.0 == "minecraft:jump_boost")
+            .map_or(0.0, |e| 0.1 * (e.2 + 1) as f32)
+    }
+    /// `Entity.getBlockJumpFactor`: the block the mob stands in, or the one
+    /// below that affects movement when the current block has a neutral jump factor of 1.0.
+    pub fn block_jump_factor(&self, w: &MobWorld) -> f32 {
+        let properties = w.movement;
+        let current = w.world.block(
+            self.position.x.floor() as i32,
+            self.position.y.floor() as i32,
+            self.position.z.floor() as i32,
+        );
+        let below = self.on_pos(0.500_001);
+        let lower = w.world.block(below[0], below[1], below[2]);
+        let current = properties
+            .get(current)
+            .map_or(1.0, |p| p.coefficients.jump_factor);
+        let lower = properties
+            .get(lower)
+            .map_or(1.0, |p| p.coefficients.jump_factor);
+        if current == 1.0 { lower } else { current }
     }
     /// LivingEntity.updateWalkAnimation (client calculateEntityAnimation).
     pub fn update_walk_animation(&mut self) {
@@ -1640,6 +2065,39 @@ impl horizon_world::water_splash::WaterSplashWorld for Splash<'_> {
     }
 }
 
+/// `Entity.getEyePosition(partialTick)` as the cell the renderer lights an
+/// entity from (`Entity.getLightProbePosition` is that position and
+/// `EntityRenderer.getPackedLightCoords` takes `BlockPos.containing` of it):
+/// `Mth.lerp(partialTick, xo, x)` on each axis, plus `getEyeHeight()` on y.
+pub fn eye_probe_cell(previous: Vec3, position: Vec3, eye_height: f64, partial: f64) -> [i32; 3] {
+    let at = previous.lerp(position, partial);
+    [
+        at.x.floor() as i32,
+        (at.y + eye_height).floor() as i32,
+        at.z.floor() as i32,
+    ]
+}
+
+/// `Entity.doWaterSplashEffect` for a mob this window is drawing.
+/// `Level.addParticle` runs on the client. `ClientLevel.playSeededSound`
+/// ignores `Entity.playSound` (`except` is null), and the SPLASH game event
+/// stays on the server, so only the bubble and splash particles are kept.
+pub fn client_water_splash(mob: &mut Mob, out: &mut Vec<MobEvent>) {
+    let mut events = Vec::new();
+    let _ = horizon_world::water_splash::water_splash(
+        &mut Splash {
+            mob,
+            events: &mut events,
+        },
+        1_000_000,
+    );
+    out.extend(
+        events
+            .into_iter()
+            .filter(|event| matches!(event, MobEvent::ParticleAt { .. })),
+    );
+}
+
 /// `Entity.restituteMovementAfterCollisions`' native inputs, bound for a mob:
 /// its own bounciness attribute, the block's coefficients and the pose of a
 /// mob that never sneaks. The phases themselves are
@@ -1723,9 +2181,11 @@ impl RestitutionWorld for MobRestitution<'_, '_> {
     fn bounce_event(&mut self) -> Result<(), ()> {
         Ok(())
     }
-    /// Nothing to mark: the bounce is already the velocity of this tick, and
-    /// the mob tracker sends the position and velocity it reads.
-    fn mark_position_for_sync(&mut self) {}
+    /// `Entity.syncPosition`: the tracker keeps where the mob bounced as a
+    /// step of its next move (`SteppedInterpolationTracker.updateTracking`).
+    fn mark_position_for_sync(&mut self) {
+        self.mob.sync_position = true;
+    }
     fn set_velocity(&mut self, velocity: Vec3) -> Result<(), ()> {
         self.mob.velocity = velocity;
         Ok(())
@@ -1733,308 +2193,20 @@ impl RestitutionWorld for MobRestitution<'_, '_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    /// A pig dropped hard onto a block bounces by that block's restitution
-    /// (`Entity.getBlockBounciness`): landing on a slime block sends it back
-    /// up, landing on stone stops it dead. The same 8-block fall then costs the
-    /// pig what the block's own `fallOn` allows (`Block.fallOn`): all 5 on
-    /// stone, 1 on hay or honey, 0 on slime, 1 on a bed, and a stalagmite kills.
-    #[test]
-    fn a_mob_bounces_off_a_bouncy_block_and_not_off_stone() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client")
-            .join(horizon_core::VANILLA_VERSION);
-        if !root.join("entity-types.json").exists()
-            || !root.join("movement-properties.nbt").exists()
-        {
-            return;
-        }
-        let assets = crate::assets::Assets::load(&root).unwrap();
-        let registry = assets.registry;
-        let facts = crate::blocks::BlockFacts::load(&root, registry).unwrap();
-        let motion = crate::motion::MotionResources::load(&root, &assets).unwrap();
-        let data = super::super::MobData::load(&root, &facts);
-        let types = super::super::MobTypes::load(&root).unwrap();
-        let biomes = crate::biome::Biomes::load(&root).unwrap();
-        let items = crate::items::Items::load(
-            &root,
-            registry,
-            &facts,
-            &horizon_world::loot::PackOverlay::NONE,
-        )
-        .unwrap();
-        let collision = crate::collisions::load(&root, registry).unwrap();
-        let lid_openers = std::collections::HashMap::new();
-        for (ground, bounces, health) in [
-            ("minecraft:slime_block", true, 10.0),
-            ("minecraft:stone", false, 5.0),
-            ("minecraft:hay_block", false, 9.0),
-            ("minecraft:honey_block", false, 9.0),
-            ("minecraft:red_bed", true, 9.0),
-            ("minecraft:pointed_dripstone", false, 0.0),
-        ] {
-            let air = registry.default_state("minecraft:air").unwrap();
-            let mut world = crate::world::World::new(air, 0);
-            world.chunks.insert(
-                (0, 0),
-                std::sync::Arc::new(crate::chunk::Chunk::empty(0, 0)),
-            );
-            let floor = registry.default_state(ground).unwrap();
-            for x in 0..=1 {
-                for z in 0..=1 {
-                    world.set(x, 0, z, floor).unwrap();
-                }
-            }
-            let w = MobWorld {
-                teams: Default::default(),
-                world: &world,
-                registry,
-                facts: &facts,
-                fluid_tables: &motion.fluids,
-                movement: &motion.blocks,
-                collision: &collision,
-                data: &data,
-                player: None,
-                nearest_player: None,
-                others: &[],
-                dragon: None,
-                leash_boats: &[],
-                others_grid: None,
-                others_index: None,
-                daylight: true,
-                monsters_burn: false,
-                game_time: 1000,
-                day_time: 18000,
-                raining: false,
-                thundering: false,
-                nether: false,
-                block_tags: &items.block_tags,
-                landing: &motion.landing,
-                biomes: &biomes,
-                universal_anger: false,
-                mob_griefing: true,
-                mob_drops: true,
-                max_entity_cramming: 24,
-                difficulty: super::super::spawning::LocalDifficulty::new(2, 18000, 0, 0.0),
-                end: false,
-                world_seed: 0,
-                sea_level: 63,
-                items: Some(&items),
-                lid_openers: &lid_openers,
-                mod_effects: None,
-                border: None,
-            };
-            let kind = std::sync::Arc::new(types.types["minecraft:pig"].clone());
-            let mut m = Mob::new(1, kind, Vec3::new(0.5, 1.0, 0.5), 0.0);
-            // Falling faster than gravity, so the landing is hard enough.
-            m.velocity = Vec3::new(0.0, -1.0, 0.0);
-            m.fall_distance = 8.0;
-            m.do_move(&w, &mut Vec::new());
-            assert_eq!(m.health, health, "{ground}: health after an 8 block fall");
-            assert!(
-                m.vertical_collision_below,
-                "{ground}: the pig lands on the block"
-            );
-            if bounces {
-                assert!(
-                    m.velocity.y > 0.0,
-                    "{ground}: restitution sends the pig back up, got {}",
-                    m.velocity.y
-                );
-            } else {
-                assert!(
-                    m.velocity.y <= 0.0,
-                    "{ground}: no bounce, got {}",
-                    m.velocity.y
-                );
-            }
-        }
-    }
-
-    /// `LivingEntity.travelInFluid` ends with
-    /// `floatInLiquidWhileRidden(FluidTags.ENTITY_FLOATABLE)`: a mount that
-    /// carries a passenger, is in `minecraft:can_float_while_ridden` and sits
-    /// deeper in the water than its jump threshold gains 0.04 a tick upwards.
-    /// That is what keeps a ridden horse and its rider afloat; an empty horse
-    /// gets nothing and goes on sinking.
-    #[test]
-    fn a_ridden_horse_floats_in_deep_water() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client")
-            .join(horizon_core::VANILLA_VERSION);
-        if !root.join("entity-types.json").exists()
-            || !root.join("movement-properties.nbt").exists()
-        {
-            return;
-        }
-        let assets = crate::assets::Assets::load(&root).unwrap();
-        let registry = assets.registry;
-        let facts = crate::blocks::BlockFacts::load(&root, registry).unwrap();
-        let motion = crate::motion::MotionResources::load(&root, &assets).unwrap();
-        let data = super::super::MobData::load(&root, &facts);
-        let types = super::super::MobTypes::load(&root).unwrap();
-        let biomes = crate::biome::Biomes::load(&root).unwrap();
-        let items = crate::items::Items::load(
-            &root,
-            registry,
-            &facts,
-            &horizon_world::loot::PackOverlay::NONE,
-        )
-        .unwrap();
-        let collision = crate::collisions::load(&root, registry).unwrap();
-        let lid_openers = std::collections::HashMap::new();
-        let air = registry.default_state("minecraft:air").unwrap();
-        let water = registry.default_state("minecraft:water").unwrap();
-        let mut world = crate::world::World::new(air, 0);
-        world.chunks.insert(
-            (0, 0),
-            std::sync::Arc::new(crate::chunk::Chunk::empty(0, 0)),
-        );
-        for x in 4..=12 {
-            for z in 4..=12 {
-                for y in 63..=66 {
-                    world.set(x, y, z, water).unwrap();
-                }
-            }
-        }
-        let w = MobWorld {
-            teams: Default::default(),
-            world: &world,
-            registry,
-            facts: &facts,
-            fluid_tables: &motion.fluids,
-            movement: &motion.blocks,
-            collision: &collision,
-            data: &data,
-            player: None,
-            nearest_player: None,
-            others: &[],
-            dragon: None,
-            leash_boats: &[],
-            others_grid: None,
-            others_index: None,
-            daylight: true,
-            monsters_burn: false,
-            game_time: 1000,
-            day_time: 18000,
-            raining: false,
-            thundering: false,
-            nether: false,
-            block_tags: &items.block_tags,
-            landing: &motion.landing,
-            biomes: &biomes,
-            universal_anger: false,
-            mob_griefing: true,
-            mob_drops: true,
-            max_entity_cramming: 24,
-            difficulty: super::super::spawning::LocalDifficulty::new(2, 18000, 0, 0.0),
-            end: false,
-            world_seed: 0,
-            sea_level: 63,
-            items: Some(&items),
-            lid_openers: &lid_openers,
-            mod_effects: None,
-            border: None,
-        };
-        let kind = std::sync::Arc::new(types.types["minecraft:horse"].clone());
-        let mut sank = 0.0;
-        let mut floated = 0.0;
-        for ridden in [false, true] {
-            let mut m = Mob::new(1, kind.clone(), Vec3::new(8.5, 64.0, 8.5), 0.0);
-            if ridden {
-                m.rider = Some(super::super::equine::Rider {
-                    strafe: 0.0,
-                    forward: 0.0,
-                    yaw: 0.0,
-                    pitch: 0.0,
-                    jump: 0.0,
-                    steer: false,
-                    sprint: false,
-                    jumping: false,
-                    client: false,
-                });
-            }
-            m.fluids.in_water = true;
-            m.fluids.water = 1.0;
-            m.travel(&w, Vec3::ZERO, &mut Vec::new());
-            if ridden {
-                floated = m.velocity.y;
-            } else {
-                sank = m.velocity.y;
-            }
-        }
-        assert!(sank < 0.0, "an empty horse sinks, got {sank}");
-        let lift = floated - sank;
-        assert!(
-            (lift - f64::from(0.04_f32)).abs() < 1.0e-9,
-            "a ridden horse gains 0.04 a tick, got {lift}"
-        );
-    }
-
-    /// `Entity.collectColliders`: the world border's wall stops a mob's move
-    /// as it stops the player's (#7080). A border of size 10 around (8, 8)
-    /// has its east wall at x = 13.
-    #[test]
-    fn the_world_border_stops_a_mob() {
-        let border =
-            horizon_core::geometry::border::BorderGeometry::new([8.0, 8.0], 10.0, 29_999_984)
-                .unwrap();
-        let build = |world: &mut crate::world::World,
-                     _: &horizon_world::registry::BlockRegistry| {
-            world.chunks.insert(
-                (0, 0),
-                std::sync::Arc::new(crate::chunk::Chunk::empty(0, 0)),
-            );
-        };
-        crate::mobs::world::with_built_test_world(&[], build, |w, types| {
-            let kind = std::sync::Arc::new(types.types["minecraft:pig"].clone());
-            let mut east_edge = [0.0; 2];
-            for (i, bordered) in [false, true].into_iter().enumerate() {
-                let w = MobWorld {
-                    border: bordered.then_some(&border),
-                    ..w.clone()
-                };
-                // 1.5 blocks east from x = 11.5: past the wall at 13 if nothing stops it.
-                let mut m = Mob::new(1, kind.clone(), Vec3::new(11.5, 64.0, 8.5), 0.0);
-                m.velocity = Vec3::new(1.5, 0.0, 0.0);
-                m.do_move(&w, &mut Vec::new());
-                east_edge[i] = m.bounds().max_position().x;
-                assert_eq!(m.horizontal_collision, bordered);
-            }
-            assert!(
-                east_edge[0] > 13.0,
-                "no border: the pig walks on, {east_edge:?}"
-            );
-            assert!(
-                (east_edge[1] - 13.0).abs() < 1.0e-7,
-                "the pig's east side stops on the wall at x = 13, {east_edge:?}"
-            );
-        });
-    }
-
-    /// `LivingEntity.checkFallDamage`'s dust: nothing within the safe distance,
-    /// `150 * min(0.2 + power / 15, 2.5)` block particles beyond it.
-    #[test]
-    fn a_landing_throws_up_dust_by_the_power_of_the_fall() {
-        // Within the safe distance of 3, or by a hair over it: power 0.
-        assert_eq!(landing_dust_count(2.5, 3.0), None);
-        assert_eq!(landing_dust_count(3.0, 3.0), None);
-        // A fall of 7: power 4, 150 * (0.2 + 4 / 15) = 70.
-        assert_eq!(landing_dust_count(7.0, 3.0), Some(70));
-        // A long fall is capped at 150 * 2.5.
-        assert_eq!(landing_dust_count(60.0, 3.0), Some(375));
-        // A mob that takes no fall damage still has a safe distance of its own.
-        assert_eq!(landing_dust_count(7.0, 10.0), None);
-    }
-    /// Over the block it lands on the dust starts at the mob; straddling
-    /// into another column it is pulled to that block's near edge.
-    #[test]
-    fn landing_dust_is_pulled_to_the_block_it_landed_on() {
-        let on = Vec3::new(4.3, 65.0, 7.6);
-        assert_eq!(landing_dust_at(on, [4, 64, 7]), on);
-        // The mob stands over block (4, 7) but its feet block is (5, 7).
-        let straddling = landing_dust_at(Vec3::new(5.1, 65.0, 7.5), [4, 64, 7]);
-        assert_eq!(straddling, Vec3::new(5.0, 65.0, 7.5));
-    }
+#[path = "living_tests.rs"]
+mod tests;
+/// `Entity.move`'s fall-reset ray for a mob, with the world's
+/// `minecraft:fall_damage_resetting` blocks.
+fn fall_reset_hit(w: &MobWorld, from: Vec3, moved: Vec3) -> bool {
+    let reset = w.block_tags.get("minecraft:fall_damage_resetting");
+    crate::entities::fall_reset_hit(
+        w.world,
+        w.fluid_tables,
+        |p| {
+            let name = &w.facts.get(w.world.block(p.x, p.y, p.z)).name;
+            reset.is_some_and(|t| t.contains(&**name))
+        },
+        from,
+        moved,
+    )
 }

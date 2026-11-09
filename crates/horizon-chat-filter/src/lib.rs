@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 mod normalise;
 
+pub use horizon_server_files::duration::{
+    DurationUnit, duration_parts, duration_text, now_millis, parse_duration,
+};
 pub use normalise::{Run, Text};
 
 /// The list built into the game, used when `words_file` is empty.
@@ -125,7 +128,11 @@ impl Filter {
                     Some(w) => (w, true),
                     None => (word, false),
                 };
-                f.allowed.push((normalise::word(word), prefix));
+                // An allow entry with no letters would allow every word (an empty prefix).
+                let runs = normalise::word(word);
+                if !runs.is_empty() {
+                    f.allowed.push((runs, prefix));
+                }
                 continue;
             }
             let (kind, word) = match line.as_bytes()[0] {
@@ -468,40 +475,6 @@ pub fn append_log(path: &Path, line: &str) -> std::io::Result<()> {
         .append(true)
         .open(path)?;
     writeln!(f, "{line}")
-}
-
-/// `/tempmute`'s duration in milliseconds: a positive whole number and a unit, `s`, `m`, `h`, `d` or
-/// `w` (`10m`, `2h`, `1d`).
-pub fn parse_duration(text: &str) -> Option<i64> {
-    let unit = match text.chars().last()? {
-        's' => 1_000,
-        'm' => MINUTE,
-        'h' => 60 * MINUTE,
-        'd' => 24 * 60 * MINUTE,
-        'w' => 7 * 24 * 60 * MINUTE,
-        _ => return None,
-    };
-    let count: i64 = text[..text.len() - 1].parse().ok()?;
-    (count > 0).then(|| count.checked_mul(unit)).flatten()
-}
-
-/// `millis` for players, rounded up: minutes up to an hour, hours up to two days, then days.
-pub fn duration_text(millis: i64) -> String {
-    let up = |unit: i64| (millis + unit - 1) / unit;
-    let (count, unit) = if millis <= 60 * MINUTE {
-        (up(MINUTE), "minute")
-    } else if millis <= 48 * 60 * MINUTE {
-        (up(60 * MINUTE), "hour")
-    } else {
-        (up(24 * 60 * MINUTE), "day")
-    };
-    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
-}
-
-pub fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` for epoch milliseconds.

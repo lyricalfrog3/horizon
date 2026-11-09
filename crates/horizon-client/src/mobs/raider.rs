@@ -144,7 +144,8 @@ pub fn register(m: &mut Mob) {
     m.ai.goals.add(4, LongDistancePatrol::new(0.7, 0.595));
     m.ai.goals.add(1, ObtainBanner::default());
     m.ai.goals.add(3, PathfindToRaid::default());
-    m.ai.goals.add(4, MoveThroughVillage::new(1.05, 1.0));
+    m.ai.goals
+        .add(4, MoveThroughVillage::new(f64::from(1.05_f32), 1.0));
     m.ai.goals.add(5, Celebration);
 }
 
@@ -184,13 +185,15 @@ pub fn find_patrol_target_from(m: &mut Mob, [x, y, z]: [i32; 3]) {
     s.patrol_target = Some([x + dx, y, z + dz]);
     s.patrolling = true;
 }
-/// The leader's ominous banner and its drop chance of 2.0 (always dropped).
+/// The leader's ominous banner and saved head drop chance of 2.0.
 ///
 /// Also keeps the full ominous stack in `armor[0]` so `SetEquipment` sends
 /// the patterned banner to clients (`Raid.getOminousBannerInstance`).
 pub fn wear_banner(m: &mut Mob) {
     m.extra.head = Some(BANNER.into());
     m.extra.armor[0] = Some(ominous_banner());
+    // Raid.setLeader and PatrollingMonster.finalizeSpawn: EquipmentSlot.HEAD.
+    super::finalize::set_drop_chance(m, 5, 2.0);
 }
 /// Why a mob was spawned (`EntitySpawnReason`), as far as raiders care.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,12 +376,22 @@ fn close_to_center(p: [i32; 3], at: Vec3, distance: f64) -> bool {
 pub struct ObtainBanner {
     path_to_banner: Option<super::path::Path>,
 }
+impl ObtainBanner {
+    /// `ObtainRaidLeaderBannerGoal.cannotPickUpBanner`, less the head-banner
+    /// and living-leader checks.
+    fn can_pick_up_banner(m: &Mob) -> bool {
+        state(m).is_some_and(|s| s.active_raid && !s.raid_over && can_be_leader(m.species()))
+    }
+}
 impl Goal for ObtainBanner {
     goal_clone!();
     fn flags(&self) -> u8 {
         MOVE
     }
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
+        if !Self::can_pick_up_banner(m) {
+            return false;
+        }
         let Some((at, item)) = state(m).and_then(|s| s.banner_at.map(|at| (at, s.banner_item)))
         else {
             return false;
@@ -396,7 +409,10 @@ impl Goal for ObtainBanner {
         false
     }
     fn can_continue(&mut self, m: &mut Mob, _cx: &mut Cx) -> bool {
-        !m.ai.nav.is_done() && state(m).is_some_and(|s| s.banner_at.is_some())
+        !m.ai.nav.is_done()
+            && state(m).is_some_and(|s| {
+                s.banner_at.is_some() && s.active_raid && !s.raid_over && can_be_leader(m.species())
+            })
     }
     fn start(&mut self, m: &mut Mob, cx: &mut Cx) {
         m.nav_move_to_path(cx.w, self.path_to_banner.take(), 1.15);
@@ -579,10 +595,13 @@ impl Goal for Celebration {
             };
             m.voice(sound, cx.events);
         }
-        if m.random
-            .next_int_bound(super::goals::reduced(50))
-            .unwrap_or(1)
-            == 0
+        // Raider.RaiderCelebration.tick: a raider riding a ravager (or any
+        // vehicle) does not jump. The roll is skipped too, as in vanilla.
+        if m.extra.mount.is_none()
+            && m.random
+                .next_int_bound(super::goals::reduced(50))
+                .unwrap_or(1)
+                == 0
         {
             m.ai.jumping = true;
         }
@@ -719,6 +738,10 @@ pub fn read_nbt(m: &mut Mob, tag: &Tag) {
     s.wave = int(tag.get("Wave")).unwrap_or(0);
     s.can_join_raid = flag(tag.get("CanJoinRaid"));
     s.raid_id = int(tag.get("RaidId"));
+    // Pillager.readAdditionalSaveData: setCanPickUpLoot(true) after the generic read.
+    if m.species() == Species::Pillager {
+        m.extra.pick_up_loot = true;
+    }
 }
 
 #[cfg(test)]
@@ -733,7 +756,7 @@ mod tests {
         assert!(!can_be_leader(Species::Witch) && !can_be_leader(Species::Ravager));
     }
     #[test]
-    fn wear_banner_keeps_the_ominous_stack_for_clients() {
+    fn wear_banner_keeps_the_stack_and_head_drop_chance() {
         use crate::mobs::sensor_scan_tests::kind;
         use std::sync::Arc;
         let mut k = (*kind()).clone();
@@ -742,6 +765,7 @@ mod tests {
         let mut m = Mob::new(1, Arc::new(k), Vec3::ZERO, 0.0);
         m.extra.raider = Some(Box::default());
         state_mut(&mut m).patrol_leader = true;
+        super::super::finalize::set_drop_chance(&mut m, 1, 0.65);
         wear_banner(&mut m);
         assert_eq!(m.extra.head.as_deref(), Some(BANNER));
         assert!(
@@ -751,6 +775,17 @@ mod tests {
                 .is_some_and(|d| d.ominous_banner)
         );
         assert!(is_captain(&m));
+        let saved = crate::entity_nbt::mob_to_nbt(&m, [0; 4], None, None, |_| None);
+        let chances = saved.get("drop_chances").unwrap();
+        assert_eq!(
+            chances.get("head"),
+            Some(&horizon_world::nbt::Tag::Float(2.0_f32.to_bits()))
+        );
+        assert_eq!(
+            chances.get("offhand"),
+            Some(&horizon_world::nbt::Tag::Float(0.65_f32.to_bits())),
+            "equipping the banner preserves other slots' explicit chances"
+        );
         // Client that only saw SetEquipment: no PatrolLeader, still a captain.
         state_mut(&mut m).patrol_leader = false;
         assert!(is_captain(&m));
@@ -770,5 +805,117 @@ mod tests {
         let at = Vec3::new(10.5, 64.5, 10.5);
         assert!(close_to_center([10, 64, 10], at, 1.0));
         assert!(!close_to_center([30, 64, 10], at, 10.0));
+    }
+
+    /// `RaiderCelebration.tick` jumps only when the raider is not a passenger.
+    #[test]
+    fn a_celebrating_raider_does_not_jump_while_riding() {
+        use crate::mobs::world::with_test_world;
+        use horizon_core::random::LegacyRandom;
+        use std::sync::Arc;
+        let _ = with_test_world(&[], |w, _| {
+            let jumped = |seed: i64, riding: bool| {
+                let mut k = (*crate::mobs::sensor_scan_tests::kind()).clone();
+                k.id = "minecraft:pillager".into();
+                k.species = Species::Pillager;
+                let mut m = Mob::new(1, Arc::new(k), Vec3::ZERO, 0.0);
+                m.random = LegacyRandom::new(seed);
+                m.extra.raider = Some(Box::default());
+                if riding {
+                    m.extra.mount = Some(9);
+                }
+                let mut goal = Celebration;
+                let mut lr = LegacyRandom::new(1);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w,
+                    lr: &mut lr,
+                    events: &mut events,
+                };
+                goal.tick(&mut m, &mut cx);
+                m.ai.jumping
+            };
+            let seed = (1..500)
+                .find(|seed| jumped(*seed, false))
+                .expect("some seed celebrates with a jump");
+            assert!(jumped(seed, false));
+            assert!(!jumped(seed, true));
+        });
+    }
+
+    /// `ObtainRaidLeaderBannerGoal.canContinueToUse` ends with
+    /// `!cannotPickUpBanner()`: a raid that is over stops the banner chase.
+    #[test]
+    fn a_banner_chase_stops_when_the_raid_ends() {
+        use crate::mobs::world::with_built_test_world;
+        use std::sync::Arc;
+        let mut outcomes = Vec::new();
+        if !with_built_test_world(
+            &[],
+            |world, registry| {
+                for (cx, cz) in [
+                    (-1, -1),
+                    (-1, 0),
+                    (-1, 1),
+                    (0, -1),
+                    (0, 0),
+                    (0, 1),
+                    (1, -1),
+                    (1, 0),
+                    (1, 1),
+                ] {
+                    world
+                        .chunks
+                        .insert((cx, cz), Arc::new(crate::chunk::Chunk::empty(cx, cz)));
+                }
+                let stone = registry.default_state("minecraft:stone").unwrap();
+                for x in -16..32 {
+                    for z in -16..32 {
+                        world.set(x, 0, z, stone).unwrap();
+                    }
+                }
+            },
+            |w, types| {
+                let mut m = Mob::new(
+                    1,
+                    Arc::new(types.types["minecraft:pillager"].clone()),
+                    Vec3::new(0.5, 1.0, 0.5),
+                    0.0,
+                );
+                m.on_ground = true;
+                m.extra.raider = Some(Box::default());
+                let s = state_mut(&mut m);
+                s.active_raid = true;
+                s.banner_at = Some([5.5, 1.0, 0.5]);
+                s.banner_item = 9;
+                m.ai.goals.add(
+                    1,
+                    ObtainBanner {
+                        path_to_banner: None,
+                    },
+                );
+                let mut lr = horizon_core::random::LegacyRandom::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w,
+                    lr: &mut lr,
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                outcomes.push(goals.is_running("ObtainBanner"));
+                state_mut(&mut m).raid_over = true;
+                goals.tick(&mut m, &mut cx);
+                outcomes.push(goals.is_running("ObtainBanner"));
+                m.ai.goals = goals;
+            },
+        ) {
+            return;
+        }
+        assert_eq!(
+            outcomes,
+            vec![true, false],
+            "the raid ending stops the chase"
+        );
     }
 }

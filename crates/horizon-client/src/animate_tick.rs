@@ -8,7 +8,7 @@ use crate::{
     blocks::{BlockFacts, Fluid},
     command::args::GameMode,
     items::ItemStack,
-    particles::{ParticleEngine, ParticleOptions, ParticleType as T, along_axis},
+    particles::{ParticleEngine, ParticleLevel, ParticleOptions, ParticleType as T, along_axis},
     world::World,
 };
 use horizon_core::{
@@ -276,8 +276,11 @@ fn concrete_powder_color(dye: &str) -> u32 {
         _ => 0x191919,
     }
 }
-/// `RedstoneWireBlock.COLORS`.
+/// `RedstoneWireBlock.COLORS`, or a pack's.
 fn redstone_color(power: u8) -> [f32; 3] {
+    if let Some(c) = crate::pack_palette::redstone(power) {
+        return [16, 8, 0].map(|shift| ((c >> shift) & 255) as f32 / 255.0);
+    }
     let f = f32::from(power) / 15.0;
     let r = f * 0.6 + if f > 0.0 { 0.4 } else { 0.3 };
     let g = (f * f * 0.7 - 0.5).clamp(0.0, 1.0);
@@ -321,7 +324,7 @@ pub struct AnimateTables {
     pale_oak_logs: Vec<bool>,
     /// `FireBlock.canBurn`: states with ignite odds above zero (none waterlogged).
     burnable: Vec<bool>,
-    /// Biome id -> ambient particles and probabilities (`minecraft:visual/ambient_particles`).
+    /// Biome id -> ambient particles and probabilities from the prepared pack.
     ambient: Vec<Vec<(T, f32)>>,
     /// Per state: 1 for a pointed dripstone, 2 for one whose tip points down.
     dripstone: Vec<u8>,
@@ -511,6 +514,30 @@ impl AnimateContext<'_> {
             ],
         ))
     }
+    /// The centre, in the horizontal plane, of the pick shape's bounds before
+    /// the model offset - a flower's own box, where its collision shape is
+    /// empty. `WitherRoseBlock.animateTick` reads it off `getShape`.
+    fn outline_center(&self, state: BlockStateId) -> [f64; 2] {
+        let outline = &self.facts.get(state).outline;
+        if outline.is_empty() {
+            return [0.5; 2];
+        }
+        let seed = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let [x1, z1, x2, z2] = outline.iter().fold(seed, |b, box_| {
+            [
+                b[0].min(box_[0]),
+                b[1].min(box_[2]),
+                b[2].max(box_[3]),
+                b[3].max(box_[5]),
+            ]
+        });
+        [(x1 + x2) / 2.0, (z1 + z2) / 2.0]
+    }
     /// `Level.getMaxLocalRawBrightness`: the brighter of block light and
     /// sky light less the sky darkening.
     fn max_local_raw_brightness(&self, p: [i32; 3]) -> i32 {
@@ -575,7 +602,19 @@ fn do_animate_tick(
         return;
     }
     let state = ctx.state(pos);
-    block_animate_tick(tables, engine, ctx, state, pos, center);
+    // A Polytone block modifier's `disable_particles` stops the block's own animate tick.
+    if !engine.polytone_disables_particles(state) {
+        block_animate_tick(tables, engine, ctx, state, pos, center);
+    }
+    // Resource packs' Polytone block emitters (#11486): nothing without such a pack.
+    let level = ParticleLevel {
+        world: ctx.world,
+        facts: ctx.facts,
+        collision: ctx.collision,
+        player: None,
+        cached_chunk: std::cell::Cell::new(None),
+    };
+    engine.polytone_animate(&level, pos);
     let facts = ctx.facts.get(state);
     if facts.fluid != Fluid::None {
         fluid_animate_tick(
@@ -608,7 +647,16 @@ fn do_animate_tick(
             .chunks
             .get(&(x >> 4, z >> 4))
             .map_or(0, |c| c.biome(x, y, z));
-        for &(ty, probability) in tables.ambient.get(biome as usize).into_iter().flatten() {
+        let info = ctx.biomes.get(biome);
+        let particles: &[(T, f32)] = if ctx.biomes.pack_file(&info.name).is_some() {
+            &info.ambient_particles
+        } else {
+            tables
+                .ambient
+                .get(biome as usize)
+                .map_or(&[][..], Vec::as_slice)
+        };
+        for &(ty, probability) in particles {
             // AmbientParticle.canSpawn: random.nextFloat() <= probability.
             let random = engine.random();
             if random.next_float() <= probability {
@@ -917,8 +965,11 @@ fn block_animate_tick(
             }
             let r = engine.random();
             if spawn_particles && next_int(r, 5) == 0 {
-                let count = next_int(r, 1) + 1;
-                for _ in 0..count {
+                // Vanilla's `for (int i = 0; i < random.nextInt(1) + 1; i++)`
+                // asks the bound again on every pass, so the check after the
+                // body is a second draw.
+                let mut i = 0;
+                while i < next_int(engine.random(), 1) + 1 {
                     let r = engine.random();
                     let v = [
                         f64::from(r.next_float() / 2.0),
@@ -926,6 +977,7 @@ fn block_animate_tick(
                         f64::from(r.next_float() / 2.0),
                     ];
                     add(engine, T::Lava, [fx + 0.5, fy + 0.5, fz + 0.5], v);
+                    i += 1;
                 }
             }
         }
@@ -1172,10 +1224,12 @@ fn block_animate_tick(
         Animate::CandleCake => candle(engine, [fx + 0.5, fy + 1.0, fz + 0.5]),
         Animate::BrewingStand => {
             let r = engine.random();
+            // `random.nextFloat() * 0.2` and `* 0.3` are double products; only
+            // the draw itself is single precision.
             let p = [
-                fx + 0.4 + f64::from(r.next_float() * 0.2),
-                fy + 0.7 + f64::from(r.next_float() * 0.3),
-                fz + 0.4 + f64::from(r.next_float() * 0.2),
+                fx + 0.4 + f64::from(r.next_float()) * 0.2,
+                fy + 0.7 + f64::from(r.next_float()) * 0.3,
+                fz + 0.4 + f64::from(r.next_float()) * 0.2,
             ];
             add(engine, T::Smoke, p, [0.0; 3]);
         }
@@ -1372,10 +1426,10 @@ fn block_animate_tick(
         }
         Animate::PointedDripstone => dripstone_drip(tables, engine, ctx, state, pos),
         Animate::WitherRose => {
-            // WitherRoseBlock.animateTick: smoke puffs at the centre of the shape.
-            let center = ctx.shape_y(pos).map_or([0.5; 2], |s| {
-                [(s.2[0] + s.2[1]) / 2.0, (s.2[2] + s.2[3]) / 2.0]
-            });
+            // WitherRoseBlock.animateTick: smoke puffs at the centre of
+            // `getShape`, the pick shape a flower's `getOffset` moves per column,
+            // which is not the (empty) collision shape.
+            let center = ctx.outline_center(state);
             let offset = ctx.offset_of(state, pos);
             let x = fx + center[0] + offset[0];
             let z = fz + center[1] + offset[2];
@@ -1444,7 +1498,9 @@ fn block_animate_tick(
                 let flip_z = f64::from(next_int(r, 2) * 2 - 1);
                 let p = [
                     fx + 0.5 + 0.25 * flip_x,
-                    fy + f64::from(r.next_float()),
+                    // `pos.getY() + random.nextFloat()` adds an int to a float:
+                    // the sum rounds to single precision before it widens.
+                    f64::from(pos[1] as f32 + r.next_float()),
                     fz + 0.5 + 0.25 * flip_z,
                 ];
                 let v = [
@@ -1482,10 +1538,13 @@ fn block_animate_tick(
             }
         }
         Animate::Beehive => {
-            // BeehiveBlock.animateTick: nextInt(1) + 1 attempts.
-            let attempts = next_int(engine.random(), 1) + 1;
-            for _ in 0..attempts {
+            // BeehiveBlock.animateTick: `for (i = 0; i < random.nextInt(1) + 1; i++)`
+            // re-reads its bound on every trip, so the level random is asked
+            // once before the attempt and once more to end the loop.
+            let mut attempt = 0;
+            while attempt < next_int(engine.random(), 1) + 1 {
                 beehive_drip(tables, engine, ctx, state, pos);
+                attempt += 1;
             }
         }
         Animate::RedstoneOre => {
@@ -1567,7 +1626,9 @@ fn block_animate_tick(
                     } else {
                         f64::from(step[2]) * 0.6
                     };
-                let ya = f64::from(r.next_float() * 0.04);
+                // `random.nextFloat() * 0.04`: the double literal keeps the
+                // product in double precision.
+                let ya = f64::from(r.next_float()) * 0.04;
                 engine.add(
                     &crate::particles::ParticleOptions::sculk_to_redstone(),
                     [x, fy + 0.25, z],
@@ -1592,7 +1653,9 @@ fn block_animate_tick(
                 fy + 1.0,
                 fz + 0.5 + (0.5 - r.next_double()),
             ];
-            let ya = f64::from(r.next_float() * 0.04);
+            // `random.nextFloat() * 0.04`: the double literal keeps the product
+            // in double precision.
+            let ya = f64::from(r.next_float()) * 0.04;
             add(engine, T::ReversePortal, p, [0.0, ya, 0.0]);
         }
         Animate::BubbleColumn { drag } => {
@@ -1895,9 +1958,17 @@ pub fn campfire_particles<'a>(
         };
         let r = engine.random();
         if r.next_float() < 0.11 {
-            let count = next_int(r, 2) + 2;
-            for _ in 0..count {
+            // `for (int i = 0; i < random.nextInt(2) + 2; i++)`: the iteration
+            // bound is drawn again on every pass, so the loop keeps asking the
+            // random whether to make one more puff.
+            let mut made = 0;
+            loop {
+                let count = next_int(engine.random(), 2) + 2;
+                if made >= count {
+                    break;
+                }
                 make_campfire_smoke(engine, pos, signal, false);
+                made += 1;
             }
         }
         // The smoke over each cooking item, at the slot's corner of the fire.
@@ -1924,8 +1995,10 @@ pub fn campfire_particles<'a>(
         }
     }
 }
-/// `CampfireBlock.makeParticles` (always visible, overriding the limiter);
-/// `smoking` adds the plain smoke puff at the logs.
+/// `CampfireBlock.makeParticles`: the cosy or signal smoke through
+/// `addAlwaysVisibleParticle(.., true, ..)` (it overrides the limiter but still
+/// rolls the Particles option); `smoking` adds the plain smoke puff at the logs
+/// through `addParticle`, so the limiter can drop it.
 pub fn make_campfire_smoke(
     engine: &mut ParticleEngine,
     pos: [i32; 3],
@@ -1944,7 +2017,13 @@ pub fn make_campfire_smoke(
     } else {
         T::CampfireCosySmoke
     };
-    engine.create(&ParticleOptions::simple(ty), [x, y, z], [0.0, 0.07, 0.0]);
+    engine.add_with(
+        &ParticleOptions::simple(ty),
+        [x, y, z],
+        [0.0, 0.07, 0.0],
+        true,
+        true,
+    );
     if smoking {
         let r = engine.random();
         let dx = r.next_double() / 4.0 * sign(r);
@@ -1954,13 +2033,49 @@ pub fn make_campfire_smoke(
             f64::from(pos[1]) + 0.4,
             f64::from(pos[2]) + 0.5 + dz,
         ];
-        engine.create(&ParticleOptions::simple(T::Smoke), at, [0.0, 0.005, 0.0]);
+        add(engine, T::Smoke, at, [0.0, 0.005, 0.0]);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// `CampfireBlock.makeParticles` through `ClientLevel.doAddParticle`: the
+    /// cosy smoke overrides the limiter, the plain smoke does not, so it is
+    /// dropped beyond 32 blocks and at Particles: Minimal, and at Decreased
+    /// each puff is dropped when `calculateParticleLevel`'s `nextInt(3)` is 0.
+    #[test]
+    fn doused_campfire_smoke_goes_through_the_particle_limiter() {
+        use horizon_core::random::RandomSource as _;
+        use std::collections::{HashMap, HashSet};
+        let run = |level: u8, camera: [f64; 3]| {
+            let mut engine = ParticleEngine::new(Path::new(""), &HashMap::new(), &HashSet::new());
+            engine.seed_randoms(5, 9, 0);
+            engine.created_requests = Some(Vec::new());
+            engine.particle_level = level;
+            engine.camera = camera;
+            for _ in 0..20 {
+                make_campfire_smoke(&mut engine, [0, 64, 0], false, true);
+            }
+            let made = engine.created_requests.take().unwrap();
+            let count = |ty| made.iter().filter(|(o, ..)| o.ty == ty).count();
+            (count(T::CampfireCosySmoke), count(T::Smoke))
+        };
+        let near = [0.5, 65.0, 0.5];
+        assert_eq!(run(0, near), (20, 20), "All");
+        assert_eq!(run(2, near), (20, 0), "Minimal");
+        assert_eq!(run(0, [100.5, 65.0, 0.5]), (20, 0), "100 blocks away");
+        // Decreased: per puff the cosy smoke's roll, then the plain smoke's.
+        let mut level = LegacyRandom::new(9);
+        let kept = (0..20)
+            .filter(|_| {
+                level.next_int_bound(3).unwrap();
+                level.next_int_bound(3).unwrap() != 0
+            })
+            .count();
+        assert!(0 < kept && kept < 20);
+        assert_eq!(run(1, near), (20, kept), "Decreased");
+    }
     #[test]
     fn classifies_animated_blocks() {
         let none = |_: &str| None;

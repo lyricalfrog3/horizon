@@ -32,6 +32,34 @@ enum CommandCheck {
     PermissionsRequired,
 }
 
+impl Game<'_> {
+    /// `ChatListener.showMessageToPlayer`'s line and narration of a player
+    /// message: none when its sender is hidden in the Social Interactions
+    /// screen (`Minecraft.isBlocked`) or the server filtered all of it; a
+    /// partial filter mask shows and narrates `applyWithFormatting(signedContent)`
+    /// instead of the decorated `line` and `narration`.
+    pub(super) fn shown_player_chat(
+        &mut self,
+        p: &play::PlayerChat,
+        line: Text,
+        narration: String,
+    ) -> Option<(Text, String)> {
+        use super::remote::Decoration;
+        let filtered = horizon_client::chat::filtered_message(&p.content, &p.filter)?;
+        if self.social_hides(p.sender) {
+            return None;
+        }
+        if p.filter.0 != 2 {
+            return Some((line, narration));
+        }
+        Some((
+            self.decorate_chat(&p.chat_type, &filtered, Decoration::Chat),
+            self.decorate_chat(&p.chat_type, &filtered, Decoration::Narration)
+                .plain(),
+        ))
+    }
+}
+
 /// ClientPacketListener.verifyCommand over the tree the server sent.
 fn verify_command(tree: &Dispatcher, registries: &Registries, command: &str) -> CommandCheck {
     let parse = tree.parse(command, registries);
@@ -154,7 +182,9 @@ impl Game<'_> {
         }
         // Only when the server says it is in online mode (handleLogin).
         if self.remote.as_ref().is_some_and(|r| r.online_mode) {
-            auth::prepare_chat_keys(true);
+            if let Some(account) = self.auth() {
+                auth::prepare_chat_keys_for(account, true);
+            }
             self.update_chat_session();
         }
     }
@@ -169,8 +199,10 @@ impl Game<'_> {
             .as_ref()
             .is_some_and(|r| r.logged_in && r.online_mode)
         {
-            if self.remote.as_ref().is_some_and(|r| r.secure_chat.signed()) {
-                auth::prepare_chat_keys(false);
+            if self.remote.as_ref().is_some_and(|r| r.secure_chat.signed())
+                && let Some(account) = self.auth()
+            {
+                auth::prepare_chat_keys_for(account, false);
             }
             self.update_chat_session();
         }
@@ -189,7 +221,7 @@ impl Game<'_> {
         if !r.logged_in || r.profile() != account.uuid {
             return;
         }
-        let Some(keys) = auth::chat_keys() else {
+        let Some(keys) = auth::chat_keys_for(account.uuid) else {
             return;
         };
         if r.secure_chat
@@ -245,7 +277,8 @@ impl Game<'_> {
     /// (SignableCommand.of over the chat's tree, the server's once it sent one) has each of them signed,
     /// all with the same time, salt and last seen (without a chat session the
     /// signature list is empty, as in vanilla); any other command goes as the
-    /// unsigned packet.
+    /// unsigned packet on releases that have one. Before 1.20.5 even a command
+    /// without message arguments carries the real last-seen acknowledgement.
     pub(super) fn send_command(&mut self, command: &str) {
         let Some(r) = self.remote.as_mut() else {
             return;
@@ -257,7 +290,12 @@ impl Game<'_> {
         } else {
             Vec::new()
         };
-        if arguments.is_empty() {
+        if arguments.is_empty()
+            && !r
+                .session
+                .server_version()
+                .at_most(horizon_protocol::adapter::ServerVersion::V1_20_3)
+        {
             self.send(S::ChatCommand(play::ChatCommand {
                 command: command.to_owned(),
             }));
@@ -314,9 +352,9 @@ impl Game<'_> {
         let over_screen = self.screen != Screen::Playing || self.dialog_open();
         let (message, accept) = match check {
             CommandCheck::NoIssues => {
-                self.send(S::ChatCommand(play::ChatCommand {
-                    command: command.to_owned(),
-                }));
+                // Verification above excludes message arguments. Use the ordinary sender so
+                // releases without an unsigned command packet still acknowledge seen chat.
+                self.send_command(command);
                 return;
             }
             CommandCheck::ParseErrors => (
@@ -380,6 +418,7 @@ impl Game<'_> {
         let Some(prompt) = &self.command_prompt else {
             return;
         };
+        horizon_client::widgets::cover_frame();
         horizon_client::widgets::begin_screen(|| {
             super::screen_info::confirm(
                 "multiplayer/confirm_command",
@@ -408,8 +447,9 @@ impl Game<'_> {
                 &[],
             ),
         ];
-        self.command_prompt_layout(prompt, (w, h))
-            .draw(batch, atlas, self.cursor, &labels);
+        let mut layout = self.command_prompt_layout(prompt, (w, h));
+        layout.declare_no(1);
+        layout.draw(batch, atlas, self.cursor, &labels);
     }
 
     /// The confirmation's answer; on no, what was behind it is back.
@@ -426,7 +466,9 @@ impl Game<'_> {
                 }
             }
             // Gui.openChatAndAddText.
-            (true, CommandAccept::Suggest, _) => self.open_chat(&format!("/{}", prompt.command)),
+            (true, CommandAccept::Suggest, _) => {
+                self.open_chat(&format!("/{}", prompt.command), false)
+            }
             (true, CommandAccept::Copy, _) => {
                 use horizon_client::clipboard::Clipboard;
                 self.clipboard.set(&format!("/{}", prompt.command));

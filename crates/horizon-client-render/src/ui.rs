@@ -134,6 +134,14 @@ fn scaling(sprite: &str, r: &Rect) -> NineSlice {
         width: r.w,
         height: r.h,
         border: match sprite {
+            "horizon/jei/button_enabled_v2"
+            | "horizon/jei/button_disabled_v2"
+            | "horizon/jei/button_highlight_v2" => [6; 4],
+            "horizon/jei/search_background_v2" => [6; 4],
+            "horizon/jei/interactive_ingredient_tooltip_background" => [16; 4],
+            "horizon/jei/recipe_preview_background_v2" => [16; 4],
+            "horizon/jei/scrollbar_background_v2" => [6; 4],
+            "horizon/jei/scrollbar_marker_v2" => [2, 2, 2, 1],
             "gui/sprites/widget/button"
             | "gui/sprites/widget/button_highlighted"
             | "gui/sprites/widget/button_disabled" => [3; 4],
@@ -193,7 +201,14 @@ pub fn nine_slice(
     color: u32,
 ) {
     if let Some(r) = atlas.sprites.get(sprite) {
-        draw_nine_slice(batch, *r, scaling(sprite, r), [x, y, w, h], color);
+        match crate::hud::sprite_modifiers::draws(atlas, sprite, *r, [x, y, w, h], color) {
+            Some(draws) => {
+                for d in draws {
+                    draw_nine_slice(batch, d.rect, scaling(&d.key, &d.rect), d.at, d.color);
+                }
+            }
+            None => draw_nine_slice(batch, *r, scaling(sprite, r), [x, y, w, h], color),
+        }
     }
 }
 /// `GuiGraphicsExtractor.blitSprite`: a sprite over `w` × `h` as its
@@ -210,7 +225,33 @@ pub fn blit_sprite(
     color: u32,
 ) {
     if let Some(r) = atlas.sprites.get(sprite) {
-        draw_sprite(batch, *r, nine_slice_metadata(sprite), [x, y, w, h], color);
+        match crate::hud::sprite_modifiers::draws(atlas, sprite, *r, [x, y, w, h], color) {
+            Some(draws) => {
+                for d in draws {
+                    draw_sprite(batch, d.rect, nine_slice_metadata(&d.key), d.at, d.color);
+                }
+            }
+            None => draw_sprite(batch, *r, nine_slice_metadata(sprite), [x, y, w, h], color),
+        }
+    }
+}
+/// `GuiGraphicsExtractor.blit(location, x, y, u, v, width, height, textureWidth,
+/// textureHeight)`: a `src` region of a sprite — in its own texture's units, as the
+/// u/v/width/height arguments are — stretched over `w` × `h`.
+pub fn blit_sprite_region(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    sprite: &str,
+    src: [f32; 4],
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: u32,
+) {
+    if let Some(r) = atlas.sprites.get(sprite) {
+        let size = [r.w as f32, r.h as f32];
+        batch.rect_uv(x, y, w, h, sub(*r, size, src), color);
     }
 }
 fn draw_sprite(
@@ -543,6 +584,39 @@ pub fn button(
         crate::widgets::Narratable::button(label.plain(), rect, active)
     });
 }
+/// A [`button`] with a job on its screen: its controller button and glyph come from `action`, so
+/// a new screen gets them by drawing this for its Done, Back, Cancel or Apply.
+#[allow(clippy::too_many_arguments)]
+pub fn action_button(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    action: crate::widgets::Action,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    label: &Text,
+    active: bool,
+    hover: bool,
+) {
+    crate::widgets::declare_action(action, [x, y, w, h], active);
+    let room = if active {
+        crate::widgets::action_glyph_room()
+    } else {
+        0.0
+    };
+    button_with_room(
+        batch,
+        atlas,
+        [x, y, w, h],
+        label,
+        active,
+        hover,
+        false,
+        room,
+        |rect| crate::widgets::Narratable::button(label.plain(), rect, active),
+    );
+}
 /// A [`button`] that vanilla narrates as another widget (a `CycleButton`, a
 /// `LockIconButton`): `narration` builds what it records from its rectangle,
 /// and only while the narrator records.
@@ -559,12 +633,77 @@ pub fn button_as(
     hover: bool,
     narration: impl FnOnce([f32; 4]) -> crate::widgets::Narratable,
 ) {
-    crate::widgets::record(&label.plain(), [x, y, w, h], active);
-    crate::widgets::narratable(|| narration([x, y, w, h]).hovered(hover));
+    button_with_room(
+        batch,
+        atlas,
+        [x, y, w, h],
+        label,
+        active,
+        hover,
+        false,
+        0.0,
+        narration,
+    );
+}
+/// An options button whose focus highlights it without changing the mouse cursor.
+/// `AbstractWidget.handleCursor` tests hover, not `isHoveredOrFocused`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn focused_button(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    rect: [f32; 4],
+    label: &Text,
+    active: bool,
+    hover: bool,
+    focused: bool,
+    action: Option<crate::widgets::Action>,
+) {
+    let room = if let Some(action) = action {
+        crate::widgets::declare_action(action, rect, active);
+        if active {
+            crate::widgets::action_glyph_room()
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    button_with_room(
+        batch,
+        atlas,
+        rect,
+        label,
+        active,
+        hover,
+        focused,
+        room,
+        |rect| crate::widgets::Narratable::button(label.plain(), rect, active),
+    );
+}
+/// A button whose label keeps `room` free at its left.
+#[allow(clippy::too_many_arguments)]
+fn button_with_room(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    [x, y, w, h]: [f32; 4],
+    label: &Text,
+    active: bool,
+    hover: bool,
+    focused: bool,
+    room: f32,
+    narration: impl FnOnce([f32; 4]) -> crate::widgets::Narratable,
+) {
+    let plain = label.plain();
+    crate::widgets::record(&plain, [x, y, w, h], active);
+    // An icon button has no label to record, and A presses it all the same.
+    if active && plain.trim().is_empty() {
+        crate::widgets::target([x, y, w, h]);
+    }
+    crate::widgets::narratable(|| narration([x, y, w, h]).hovered(hover || focused));
     crate::widgets::widget_cursor(hover, active);
     let sprite = if !active {
         "gui/sprites/widget/button_disabled"
-    } else if hover {
+    } else if hover || focused {
         "gui/sprites/widget/button_highlighted"
     } else {
         "gui/sprites/widget/button"
@@ -575,15 +714,18 @@ pub fn button_as(
     } else {
         rgba(160, 160, 160, 255)
     };
-    scrolling_text(
+    // Centred on the button, as the title's are, and only moved out from under a glyph.
+    scrolling_text_around_at(
         batch,
         atlas,
         label,
-        x + 2.0,
+        x + (w / 2.0).floor(),
+        x + 2.0 + room,
         x + w - 2.0,
         y,
         y + h,
         y + ((h - 8.0) / 2.0).floor(),
+        crate::hud_overlays::now_ms(),
         color,
     );
 }
@@ -668,8 +810,14 @@ fn slider_sprites(hover: bool, active: bool, dragging: bool) -> (&'static str, &
     slider_sprites_ext(hover, active, false, false, dragging)
 }
 
-/// Track and handle sprites: the track outline shows while dragged or focused with
-/// keyboard navigation (!can_change_value), hovering or editing highlights the handle.
+/// `AbstractSliderButton.getSprite` and `getHandleSprite`: the track outline
+/// lights while the slider is focused and its value cannot change
+/// (`isActive() && isFocused() && !canChangeValue`), the handle while it is
+/// hovered or its value can change (`isActive() && (isHovered || canChangeValue)`).
+/// `canChangeValue` is set when the slider is focused with the mouse or Tab and
+/// flipped by Enter (`setFocused`, `keyPressed`): Horizon's `can_change_value`
+/// for the keyboard, and a drag for the mouse, which focuses it with the value
+/// free to change. So a dragged slider keeps its plain track.
 fn slider_sprites_ext(
     hover: bool,
     active: bool,
@@ -677,12 +825,13 @@ fn slider_sprites_ext(
     can_change_value: bool,
     dragging: bool,
 ) -> (&'static str, &'static str) {
-    let track = if dragging || (active && focused && !can_change_value) {
+    let can_change_value = can_change_value || dragging;
+    let track = if active && focused && !can_change_value {
         "gui/sprites/widget/slider_highlighted"
     } else {
         "gui/sprites/widget/slider"
     };
-    let handle = if active && (hover || can_change_value || dragging) {
+    let handle = if active && (hover || can_change_value) {
         "gui/sprites/widget/slider_handle_highlighted"
     } else {
         "gui/sprites/widget/slider_handle"
@@ -859,8 +1008,29 @@ impl Scroll {
     }
 }
 
-/// Vertical scroll bar (AbstractScrollArea): background and scroller sprites.
+/// Vertical scroll bar of a list (AbstractScrollArea): the sprites, and the
+/// list is registered for the controller's focus (`widgets::scroll_area`).
 pub fn scrollbar(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    x: f32,
+    top: f32,
+    bottom: f32,
+    content: f32,
+    scroll: f32,
+) {
+    if content > bottom - top {
+        crate::widgets::scroll_area(
+            [0.0, top, x + 6.0, bottom - top],
+            scroll,
+            content - (bottom - top),
+        );
+    }
+    scrollbar_sprites(batch, atlas, x, top, bottom, content, scroll);
+}
+
+/// The scroll bar's background and scroller sprites.
+pub fn scrollbar_sprites(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
     x: f32,
@@ -912,9 +1082,9 @@ pub fn tooltip(batch: &mut HudBatch, atlas: &HudAtlas, lines: &[Text], cursor: (
     }
     tooltip_box(batch, atlas, lines, x, y, w, h);
 }
-/// `WidgetTooltipHolder.createTooltipPositioner`'s focused branch
-/// (`MenuTooltipPositioner`): a widget with the keyboard focus keeps the
-/// pointer where it is, and its tooltip stays against the widget at `rect`.
+/// `WidgetTooltipHolder.createTooltipPositioner` for a hovered widget
+/// (`MenuTooltipPositioner`): the tooltip follows the pointer's x and keeps
+/// 3 to 5 px from the widget at `rect`.
 pub fn tooltip_menu(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
@@ -933,6 +1103,31 @@ pub fn tooltip_menu(
         (w.ceil() as i32, h.ceil() as i32),
     );
     tooltip_box(batch, atlas, lines, x as f32, y as f32, w, h);
+}
+/// A widget's tooltip while the controller's focus is on it (Horizon's: vanilla has no gamepad
+/// input, and the hidden pointer mid-widget would put it over the widget).
+pub fn tooltip_under(batch: &mut HudBatch, atlas: &HudAtlas, lines: &[Text], rect: [f32; 4]) {
+    if lines.is_empty() {
+        return;
+    }
+    let (w, h) = tooltip_size(atlas, lines);
+    let (x, y) = tooltip_under_position((batch.width, batch.height), rect, (w, h));
+    tooltip_box(batch, atlas, lines, x, y, w, h);
+}
+/// Where `tooltip_under` puts lines of `size`: the frame's top left a pixel under the widget's
+/// bottom left, over the widget when the screen ends first, and always on the screen.
+fn tooltip_under_position(screen: (f32, f32), rect: [f32; 4], size: (f32, f32)) -> (f32, f32) {
+    // The frame reaches this far past the lines on every side.
+    const FRAME: f32 = 4.0;
+    let [x, y, _, height] = rect;
+    let right = screen.0 - size.0 - FRAME;
+    let below = y + height + 1.0 + FRAME;
+    let top = if below + size.1 + FRAME <= screen.1 {
+        below
+    } else {
+        y - 1.0 - FRAME - size.1
+    };
+    ((x + FRAME).min(right).max(FRAME), top.max(FRAME))
 }
 /// `MenuTooltipPositioner.positionTooltip`: the tooltip's top left with the
 /// pointer at `cursor`, the widget it belongs to at `rect`, and the screen.
@@ -962,14 +1157,16 @@ pub fn menu_tooltip_position(
     }
     pos
 }
-/// `MenuTooltipPositioner.getOffset`: how far the tooltip keeps from the
-/// widget's top (or bottom) edge, from `MAX_DISTANCE_TO_WIDGET` 5 to
-/// `MAX_OVERLAP_WITH_WIDGET` 3 as the pointer nears the edge.
-/// The distance over the height is an int division in vanilla, so the lerp
-/// is `height - 3` until the pointer is a whole height away, then 5.
+/// `MenuTooltipPositioner.getOffset`: how far the tooltip goes past the
+/// widget's top (or bottom) edge, `height - 3` (`MAX_OVERLAP_WITH_WIDGET`)
+/// with the pointer on the edge, down to `MAX_DISTANCE_TO_WIDGET` 5 a whole
+/// height away. The distance over the height is a float division (`i2f`,
+/// `fdiv` in 26.3's bytecode), so the offset moves smoothly with the pointer;
+/// then `Mth.lerp` and Java's float rounding.
 fn widget_offset(at: i32, edge: i32, height: i32) -> i32 {
-    let d = ((at - edge).unsigned_abs().min(height as u32) / height as u32) as f32;
-    ((height as f32 - 3.0) + d * (5.0 - (height as f32 - 3.0))).round() as i32
+    let distance = (at - edge).unsigned_abs().min(height as u32) as f32;
+    let start = (height - 3) as f32;
+    horizon_core::jmath::round_f32(start + distance / height as f32 * (5.0 - start))
 }
 fn tooltip_size(atlas: &HudAtlas, lines: &[Text]) -> (f32, f32) {
     let w = lines
@@ -1041,9 +1238,25 @@ pub struct EditBox {
     /// Grey completion shown after the text (EditBox.setSuggestion).
     pub suggestion: Option<String>,
     pub text_color: u32,
+    /// `EditBox.setCentered`: the text starts in the middle of the box's
+    /// width, not at its left edge (`BookSignScreen`'s title).
+    pub centered: bool,
+    /// `EditBox.textColorUneditable`: the colour of a box `setEditable(false)`
+    /// made read-only, which still shows its value and caret.
+    pub text_color_uneditable: u32,
+    /// `EditBox.isEditable`: a read-only box keeps the focus, the caret keys
+    /// and copy, but takes no typed text, Backspace/Delete or paste (`AnvilScreen`
+    /// sets it by its input slot).
+    pub editable: bool,
     /// `getMessage`: what the narrator calls the box ("<message> edit box:
     /// <value>").
     pub message: String,
+    /// `EditBox.setInvertHighlightedTextColor`: a selection draws its text
+    /// inverted (the default) or in the box's own colour (`AnvilScreen`).
+    pub invert_highlighted_text_color: bool,
+    /// Where a borderless box drawn in a frame of its own focuses: a controller's outline goes
+    /// round the frame, not over the text.
+    pub frame: Option<[f32; 4]>,
 }
 /// The focused text field of a screen that keeps its values as `String`s
 /// (the world list's search, world names, seeds, and the server screens): the `EditBox` state that
@@ -1143,6 +1356,29 @@ impl Caret {
         focused: bool,
         focused_at: Instant,
     ) {
+        self.draw_color(
+            batch,
+            atlas,
+            (id, value, max),
+            rect,
+            focused,
+            focused_at,
+            rgba(224, 224, 224, 255),
+        );
+    }
+    /// [`Self::draw`] with the text in `color` (`EditBox.setTextColor`): the
+    /// settings tab turns an invalid Realm name red.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_color(
+        &mut self,
+        batch: &mut HudBatch,
+        atlas: &HudAtlas,
+        (id, value, max): (crate::clipboard::FieldId, &str, usize),
+        rect: [f32; 4],
+        focused: bool,
+        focused_at: Instant,
+        color: u32,
+    ) {
         let mut idle;
         let edit = if focused {
             self.sync(id, value, max)
@@ -1154,6 +1390,7 @@ impl Caret {
         };
         [edit.x, edit.y, edit.width, edit.height] = rect;
         edit.focused = focused;
+        edit.text_color = color;
         if edit.focused_at < focused_at {
             edit.focused_at = focused_at;
         }
@@ -1305,7 +1542,12 @@ impl EditBox {
             focused_at: Instant::now(),
             suggestion: None,
             text_color: rgba(224, 224, 224, 255),
+            centered: false,
+            text_color_uneditable: rgba(112, 112, 112, 255),
+            editable: true,
             message: String::new(),
+            invert_highlighted_text_color: true,
+            frame: None,
         }
     }
     pub fn inner_width(&self) -> f32 {
@@ -1323,6 +1565,16 @@ impl EditBox {
             self.y + ((self.height - 8.0) / 2.0).floor()
         } else {
             self.y
+        }
+    }
+    /// `EditBox.updateTextPosition`: where the text starts, `(width - text
+    /// width) / 2` in for a centred box (vanilla's `textX`), else at
+    /// `text_x` (4 in from a border).
+    pub fn text_start_x(&self, text_width: f32) -> f32 {
+        if self.centered {
+            self.x + ((self.width - text_width) / 2.0).floor()
+        } else {
+            self.text_x()
         }
     }
     pub fn reset_blink(&mut self) {
@@ -1348,6 +1600,12 @@ impl EditBox {
     }
     /// EditBox.insertText: replace the selection, respecting the maximum length.
     pub fn insert_text(&mut self, text: &str) {
+        // `EditBox.charTyped` only inserts through `canConsumeInput`, which a
+        // read-only box fails; the screens here hand typed text to this method
+        // directly.
+        if !self.editable {
+            return;
+        }
         let (a, b) = self.selected();
         let filtered = crate::clipboard::filter_text(text, self.multiline);
         let room = self
@@ -1359,8 +1617,12 @@ impl EditBox {
         let pos = a + char_len(&insert);
         self.set_cursor(pos, false);
     }
-    /// Delete `n` characters (negative: backwards) or the selection.
+    /// Delete `n` characters (negative: backwards) or the selection. A
+    /// read-only box consumes the key without changing its value.
     pub fn delete_chars(&mut self, n: isize) {
+        if !self.editable {
+            return;
+        }
         if self.cursor != self.highlight {
             self.insert_text("");
             return;
@@ -1397,8 +1659,13 @@ impl EditBox {
     /// EditBox.findClickedPositionInText: the character boundary under GUI `x`.
     pub fn position_at(&mut self, atlas: &HudAtlas, x: f32) -> usize {
         self.layout(atlas);
-        let room = (x.floor() - self.text_x()).min(self.inner_width());
         let rest: String = self.value.chars().skip(self.display).collect();
+        let shown: String = rest
+            .chars()
+            .take(atlas.font.fit(&rest, self.inner_width()))
+            .collect();
+        let start = self.text_start_x(atlas.font.width_text(&Text::literal(shown.as_str())));
+        let room = (x.floor() - start).min(self.inner_width());
         self.display + atlas.font.fit(&rest, room)
     }
     /// EditBox.onClick: the cursor to the pointer, extending the selection
@@ -1463,20 +1730,24 @@ impl EditBox {
         use winit::keyboard::KeyCode as K;
         match key {
             K::Backspace => {
-                let n = if ctrl {
-                    self.word_position(-1) as isize - self.cursor as isize
-                } else {
-                    -1
-                };
-                self.delete_chars(n);
+                if self.editable {
+                    let n = if ctrl {
+                        self.word_position(-1) as isize - self.cursor as isize
+                    } else {
+                        -1
+                    };
+                    self.delete_chars(n);
+                }
             }
             K::Delete => {
-                let n = if ctrl {
-                    self.word_position(1) as isize - self.cursor as isize
-                } else {
-                    1
-                };
-                self.delete_chars(n);
+                if self.editable {
+                    let n = if ctrl {
+                        self.word_position(1) as isize - self.cursor as isize
+                    } else {
+                        1
+                    };
+                    self.delete_chars(n);
+                }
             }
             K::ArrowLeft => {
                 let p = if ctrl {
@@ -1510,6 +1781,19 @@ impl EditBox {
         shortcut: crate::clipboard::EditShortcut,
         clipboard: &mut dyn crate::clipboard::Clipboard,
     ) -> bool {
+        use crate::clipboard::EditShortcut;
+        if !self.editable {
+            match shortcut {
+                // EditBox.keyPressed: Cut copies the selection, then does not
+                // take it out of a read-only box.
+                EditShortcut::Cut => {
+                    clipboard.set(&self.selected_text());
+                    return false;
+                }
+                EditShortcut::Paste => return false,
+                EditShortcut::SelectAll | EditShortcut::Copy => {}
+            }
+        }
         let before = self.value.clone();
         crate::clipboard::apply(self, shortcut, clipboard);
         self.reset_blink();
@@ -1523,6 +1807,16 @@ impl EditBox {
     }
     /// Draw the field; `format` styles the visible text (command colouring).
     pub fn draw(&mut self, batch: &mut HudBatch, atlas: &HudAtlas, format: Option<&Text>) {
+        self.draw_with_skin(batch, atlas, format, None);
+    }
+
+    pub fn draw_with_skin(
+        &mut self,
+        batch: &mut HudBatch,
+        atlas: &HudAtlas,
+        format: Option<&Text>,
+        skin: Option<&str>,
+    ) {
         self.layout(atlas);
         crate::widgets::target_as(
             [self.x, self.y, self.width, self.height],
@@ -1537,11 +1831,11 @@ impl EditBox {
             .focused(self.focused)
         });
         if self.bordered {
-            let sprite = if self.focused {
+            let sprite = skin.unwrap_or(if self.focused {
                 "gui/sprites/widget/text_field_highlighted"
             } else {
                 "gui/sprites/widget/text_field"
-            };
+            });
             nine_slice(
                 batch,
                 atlas,
@@ -1553,7 +1847,11 @@ impl EditBox {
                 u32::MAX,
             );
         }
-        let color = self.text_color;
+        let color = if self.editable {
+            self.text_color
+        } else {
+            self.text_color_uneditable
+        };
         let rest: String = self.value.chars().skip(self.display).collect();
         let shown_len = atlas.font.fit(&rest, self.inner_width());
         let displayed: String = rest.chars().take(shown_len).collect();
@@ -1574,7 +1872,12 @@ impl EditBox {
                 ),
             }
         };
-        let (tx, ty) = (self.text_x(), self.text_y());
+        let start = if self.centered {
+            self.text_start_x(atlas.font.width_text(&Text::literal(displayed.as_str())))
+        } else {
+            self.text_x()
+        };
+        let (tx, ty) = (start, self.text_y());
         let mut draw_x = tx;
         if !displayed.is_empty() {
             let half = if on_screen {
@@ -1619,7 +1922,11 @@ impl EditBox {
             let right = self.x + self.width;
             let (x0, x1) = (cursor_x.min(right), (hx - 1.0).min(right));
             let (a, b) = (x0.min(x1), x0.max(x1));
-            batch.text_highlight(atlas, (a, ty - 1.0, b - a, 11.0), true);
+            batch.text_highlight(
+                atlas,
+                (a, ty - 1.0, b - a, 11.0),
+                self.invert_highlighted_text_color,
+            );
         }
         if show_cursor {
             if insert {
@@ -1737,9 +2044,68 @@ mod tests {
         assert_eq!(scrolled_left(10.0, 40.0, 1_000), 10.0 - offset);
     }
 
-    /// The label of a widget it does not fit is clipped to the widget's box
-    /// instead of being drawn past it (the bug: `so_so`'s 590 px Create World
-    /// label ran over the button beside it).
+    /// A controller reaches an icon button only through its target, and can't press a disabled one.
+    #[test]
+    fn an_active_icon_button_is_a_focus_target_and_a_disabled_one_is_not() {
+        let atlas = atlas();
+        let mut batch = HudBatch::new([640, 480]);
+        // Whatever this thread drew before is the last frame's, then gone.
+        crate::widgets::end_frame(u64::MAX - 1);
+        button(
+            &mut batch,
+            &atlas,
+            10.0,
+            20.0,
+            20.0,
+            20.0,
+            &Text::empty(),
+            true,
+            false,
+        );
+        button(
+            &mut batch,
+            &atlas,
+            40.0,
+            20.0,
+            20.0,
+            20.0,
+            &Text::empty(),
+            false,
+            false,
+        );
+        crate::widgets::end_frame(u64::MAX);
+        let targets: Vec<[f32; 4]> = crate::widgets::last_targets()
+            .iter()
+            .map(|t| t.rect)
+            .collect();
+        assert_eq!(targets, [[10.0, 20.0, 20.0, 20.0]]);
+    }
+
+    #[test]
+    fn a_glyph_leaves_a_label_that_fits_centred() {
+        let atlas = atlas();
+        crate::widgets::set_action_glyphs(true);
+        let label = Text::literal("Done");
+        let mut plain = HudBatch::new([640, 480]);
+        button(
+            &mut plain, &atlas, 10.0, 20.0, 150.0, 20.0, &label, true, false,
+        );
+        let mut declared = HudBatch::new([640, 480]);
+        action_button(
+            &mut declared,
+            &atlas,
+            crate::widgets::Action::Done,
+            10.0,
+            20.0,
+            150.0,
+            20.0,
+            &label,
+            true,
+            false,
+        );
+        assert_eq!(quads(&plain), quads(&declared));
+    }
+
     #[test]
     fn a_label_wider_than_its_widget_stays_inside_it() {
         let atlas = atlas();
@@ -1848,15 +2214,36 @@ mod tests {
         }
     }
 
+    /// `AbstractSliderButton.getSprite`/`getHandleSprite`: a focused slider
+    /// whose value can't change lights its track, a hovered one or one whose
+    /// value can change (Tab or Enter, or the mouse's drag) lights its handle.
     #[test]
-    fn slider_track_is_outlined_only_while_dragged() {
+    fn slider_sprites_follow_focus_and_the_drag() {
+        // Hovered, at rest: plain track, lit handle.
         let (track, handle) = slider_sprites(true, true, false);
         assert_eq!(track, "gui/sprites/widget/slider");
         assert_eq!(handle, "gui/sprites/widget/slider_handle_highlighted");
+        // Dragged: still a plain track, lit handle.
         let (track, handle) = slider_sprites(true, true, true);
-        assert_eq!(track, "gui/sprites/widget/slider_highlighted");
+        assert_eq!(track, "gui/sprites/widget/slider");
         assert_eq!(handle, "gui/sprites/widget/slider_handle_highlighted");
+        // Focused with the arrow keys: the value can't change, the track lights.
+        let (track, handle) = slider_sprites_ext(false, true, true, false, false);
+        assert_eq!(track, "gui/sprites/widget/slider_highlighted");
+        assert_eq!(handle, "gui/sprites/widget/slider_handle");
+        // Focused with Tab, or Enter pressed on it: the value can change, the handle lights.
+        let (track, handle) = slider_sprites_ext(false, true, true, true, false);
+        assert_eq!(track, "gui/sprites/widget/slider");
+        assert_eq!(handle, "gui/sprites/widget/slider_handle_highlighted");
+        // Focused while the mouse drags: the track stays plain.
+        let (track, _) = slider_sprites_ext(true, true, true, false, true);
+        assert_eq!(track, "gui/sprites/widget/slider");
+        // Not hovered, not dragged: nothing is lit.
         let (track, handle) = slider_sprites(false, true, false);
+        assert_eq!(track, "gui/sprites/widget/slider");
+        assert_eq!(handle, "gui/sprites/widget/slider_handle");
+        // An inactive slider highlights neither, even when focused.
+        let (track, handle) = slider_sprites_ext(true, false, true, true, true);
         assert_eq!(track, "gui/sprites/widget/slider");
         assert_eq!(handle, "gui/sprites/widget/slider_handle");
     }
@@ -2193,6 +2580,25 @@ mod tests {
         assert!(!delete_words(&mut v, 1));
         assert_eq!(v, "stone");
     }
+    #[test]
+    fn a_pad_focused_tooltip_hangs_from_its_widgets_bottom_left() {
+        let screen = (427.0, 240.0);
+        let widget = [100.0, 100.0, 150.0, 20.0];
+        // Frame at 100, 121: lines 4 further in.
+        assert_eq!(
+            tooltip_under_position(screen, widget, (80.0, 10.0)),
+            (104.0, 125.0)
+        );
+        // The screen's right edge moves it left, its bottom puts it over the widget.
+        assert_eq!(
+            tooltip_under_position(screen, [400.0, 100.0, 20.0, 20.0], (80.0, 10.0)),
+            (343.0, 125.0)
+        );
+        assert_eq!(
+            tooltip_under_position(screen, [100.0, 215.0, 150.0, 20.0], (80.0, 10.0)),
+            (104.0, 200.0)
+        );
+    }
     /// `MenuTooltipPositioner.positionTooltip`: the pointer's 12 px offset,
     /// the 5 px screen margin, and the 3 to 5 px the tooltip keeps from the
     /// widget's top or bottom edge.
@@ -2201,16 +2607,21 @@ mod tests {
         let screen = (427, 240);
         let widget = [100, 100, 150, 20];
         let size = (80, 10);
-        // Pointer at the widget's top edge: the tooltip drops 3 px, then
-        // `getOffset`'s int division gives `height - 3` = 17 more.
+        // Pointer at the widget's top edge: the tooltip drops 3 px to 103,
+        // then `getOffset` adds round(lerp(3 / 20, 17, 5)) = round(15.2) = 15.
         assert_eq!(
             menu_tooltip_position(screen, (100, 100), widget, size),
-            (112, 120)
+            (112, 118)
         );
         // Near the right edge its left side mirrors to the pointer's left.
         assert_eq!(
             menu_tooltip_position(screen, (400, 100), widget, size),
-            (308, 120)
+            (308, 118)
+        );
+        // Halfway down the offset follows the pointer: 113 + round(9.2).
+        assert_eq!(
+            menu_tooltip_position(screen, (100, 110), widget, size),
+            (112, 122)
         );
         // A whole widget height from the edge, the offset is 5.
         assert_eq!(
@@ -2218,10 +2629,86 @@ mod tests {
             (112, 125)
         );
         // A widget too close to the bottom: the tooltip goes above it,
-        // 203 - (10 + 6) - 17.
+        // 203 - (10 + 6) - round(lerp(17 / 20, 17, 5)) = 203 - 16 - 7.
         assert_eq!(
             menu_tooltip_position(screen, (100, 200), [100, 200, 150, 20], size),
-            (112, 170)
+            (112, 180)
         );
+    }
+
+    /// `EditBox.setInvertHighlightedTextColor`: a selection inverts its text
+    /// unless the box asks it not to (the anvil's rename box).
+    #[test]
+    fn a_selection_inverts_its_text_unless_the_box_says_not_to() {
+        let mut edit = EditBox::new(0.0, 0.0, 100.0, 20.0);
+        assert!(edit.invert_highlighted_text_color);
+        edit.invert_highlighted_text_color = false;
+        edit.set_value("name");
+        edit.set_cursor(0, false);
+        edit.set_cursor(4, true);
+        assert_eq!(edit.selected_text(), "name");
+        assert!(!edit.invert_highlighted_text_color);
+    }
+
+    /// `EditBox.setEditable(false)`: the box keeps the focus, the caret keys
+    /// and copy, but `charTyped`/paste/Backspace/Delete do nothing, and Cut
+    /// copies without taking the text out. A value and the caret still show,
+    /// in `textColorUneditable`.
+    #[test]
+    fn a_read_only_edit_box_keeps_the_caret_and_copy_but_refuses_editing() {
+        use crate::clipboard::{EditShortcut, MemoryClipboard};
+        let mut edit = EditBox::new(0.0, 0.0, 100.0, 20.0);
+        edit.set_value("name");
+        edit.editable = false;
+        let mut clipboard = MemoryClipboard("pasted".into());
+        // The caret keys still work.
+        assert!(edit.key(winit::keyboard::KeyCode::ArrowLeft, false, false));
+        assert_eq!(edit.cursor, 3);
+        assert!(edit.key(winit::keyboard::KeyCode::Home, false, false));
+        assert_eq!(edit.cursor, 0);
+        // Backspace and Delete are consumed but change nothing.
+        assert!(edit.key(winit::keyboard::KeyCode::Backspace, false, false));
+        assert!(edit.key(winit::keyboard::KeyCode::Delete, false, false));
+        assert_eq!(edit.value, "name");
+        // Typed text (and an IME commit) goes through insert_text: refused.
+        edit.insert_text("typed");
+        assert_eq!(edit.value, "name");
+        edit.delete_chars(-1);
+        assert_eq!(edit.value, "name");
+        // Paste changes nothing; Cut copies and keeps the text; Copy copies.
+        edit.set_cursor(0, false);
+        edit.set_cursor(4, true);
+        assert!(!edit.shortcut(EditShortcut::Paste, &mut clipboard));
+        assert_eq!(edit.value, "name");
+        assert!(!edit.shortcut(EditShortcut::Cut, &mut clipboard));
+        assert_eq!(edit.value, "name");
+        assert_eq!(clipboard.0, "name");
+        edit.set_cursor(0, false);
+        edit.set_cursor(4, true);
+        assert!(!edit.shortcut(EditShortcut::Copy, &mut clipboard));
+        assert_eq!(clipboard.0, "name");
+        // An editable box does all of it again. (Set the caret past the
+        // selection first: insertion replaces a selection.)
+        edit.editable = true;
+        edit.set_cursor(4, false);
+        edit.insert_text("x");
+        assert_eq!(edit.value, "namex");
+        assert!(edit.key(winit::keyboard::KeyCode::Backspace, false, false));
+        assert_eq!(edit.value, "name");
+    }
+
+    /// `EditBox.setCentered` (`BookSignScreen`'s title box): with the flag the
+    /// text starts `(width - text width) / 2` in, which is also where a click
+    /// maps; without it the text starts at the box's left edge.
+    #[test]
+    fn a_centred_box_starts_its_text_in_the_middle() {
+        let mut edit = EditBox::new(10.0, 0.0, 114.0, 9.0);
+        edit.bordered = false;
+        assert_eq!(edit.text_start_x(0.0), 10.0);
+        edit.centered = true;
+        assert_eq!(edit.text_start_x(0.0), 67.0);
+        assert_eq!(edit.text_start_x(18.0), 58.0);
+        // (114 - 5) / 2 = 54.5, rounded down.
+        assert_eq!(edit.text_start_x(5.0), 64.0);
     }
 }

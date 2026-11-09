@@ -233,11 +233,11 @@ pub fn texture_path(root: &Path, texture: &str, directory: &str) -> PathBuf {
     }
     let (namespace, path) = texture.split_once(':').unwrap_or(("minecraft", texture));
     let rel = format!("assets/{namespace}/{directory}/{path}.png");
-    root.join(if horizon_optifine::paths::valid(&rel) {
-        &rel
-    } else {
-        NOWHERE
-    })
+    // No `.`, `..` or empty segment, and no `\` (a separator on Windows, where `..\..` climbs).
+    let stays = rel
+        .split('/')
+        .all(|segment| !matches!(segment, "" | "." | "..") && !segment.contains('\\'));
+    root.join(if stays { &rel } else { NOWHERE })
 }
 
 /// `SpriteSourceList.list`: every sprite id of the atlas and its origin.
@@ -379,14 +379,17 @@ pub fn generate(
             let (_, _, key) = load(palette_key, "textures/palettes")?;
             let (_, _, target) = load(palette, "textures/palettes")?;
             let mut mapped = argb(&pixels);
-            apply_palette(&mut mapped, &argb(&key), &argb(&target))?;
-            let out = mapped
+            let key = argb(&key);
+            let target = argb(&target);
+            apply_palette(&mut mapped, &key, &target)?;
+            let out: Vec<u8> = mapped
                 .iter()
                 .flat_map(|p| {
                     let [a, r, g, b] = p.to_be_bytes();
                     [r, g, b, a]
                 })
                 .collect();
+            drop(mapped);
             Some((w, h, out))
         }
     }

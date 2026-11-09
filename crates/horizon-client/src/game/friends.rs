@@ -1,22 +1,22 @@
 //! Play with friends, host side: "Start Sharing" on the Play with Friends
-//! screen (`friends_screen`, the pause menu's Friends button) opens the world to LAN if
+//! screen (`screen`, the pause menu's Friends button) opens the world to LAN if
 //! it isn't (with Open to LAN's defaults) and shares that port behind an
 //! invite code (horizon-friends). The code holds this computer's addresses
 //! and the key, so friends join with no server of ours; a relay the player
 //! configured adds a short code and a fallback. The integrated server is the
 //! LAN one, unchanged: tunnelled guests are LAN guests that connect from the
-//! loopback address.
+//! loopback address. The joining side is horizon-friends' (`game`), registered by
+//! horizon-official.
 use super::{Game, lan::LanSettings};
-use horizon_client::{
-    Result,
-    friends_screen::{self, Action, FriendsView},
-    hud::HudBatch,
-    lang,
-    text::Text,
-};
+use horizon_client::{Result, hud::HudBatch, lang, text::Text};
 use horizon_friends::{Host, HostConfig, HostEvent, PathMode, host::DEFAULT_PORT, reach, stun};
 use horizon_protocol::{GAME_VERSION, PROTOCOL_VERSION};
 use std::time::{Duration, Instant};
+
+mod screen;
+
+use screen::{self as friends_screen, Action, FriendsView};
+pub use screen::{TITLE, title};
 
 pub(super) struct Sharing {
     host: Host,
@@ -142,6 +142,7 @@ impl Game<'_> {
             return;
         };
         let mut announce = false;
+        let mut stopped = None;
         for event in sharing.host.poll() {
             match event {
                 HostEvent::Code(code) => {
@@ -165,7 +166,18 @@ impl Game<'_> {
                 HostEvent::Connected { direct: true, .. } => sharing.paths.0 += 1,
                 HostEvent::Connected { direct: false, .. } => sharing.paths.1 += 1,
                 HostEvent::Disconnected { .. } => {}
+                HostEvent::RelayStopped => {
+                    let text = lang::get_or(
+                        "horizon.friends.relay_stopped",
+                        "Too many wrong short codes, so the relay is off until you share again. Friends can still join with the full code.",
+                    );
+                    sharing.notice = Some(text.clone());
+                    stopped = Some(text);
+                }
             }
+        }
+        if let Some(text) = stopped {
+            self.system_message(Text::literal(text));
         }
         if announce {
             self.system_message(Text::literal(lang::get_or(
@@ -221,11 +233,16 @@ impl Game<'_> {
             // The system browser, as the folder buttons open their folders.
             Action::Help => {
                 if let Some(url) = &view.help {
-                    super::packs::open_folder(std::path::Path::new(url));
+                    super::packs::open_uri(url);
                 }
             }
             Action::Done => self.screen = super::Screen::Paused,
         }
+    }
+
+    /// Whether the pause menu offers Play with Friends (a singleplayer world).
+    pub(super) fn friends_shown(&self) -> bool {
+        self.friends_view().shown
     }
 
     /// What Play with Friends shows.

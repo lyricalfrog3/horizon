@@ -12,8 +12,16 @@ pub trait RenderHooks: Send + Sync {
         let _ = event;
     }
     /// The first-person hand is drawn (see [`HandDrawn`]), on every frame [`native_world_drawn`]
-    /// runs, with no hand too. API @API:hand_drawn@.
+    /// runs, with no hand too. API 364.
     fn hand_drawn(&self, event: &mut HandDrawnEvent<'_, '_>) {
+        let _ = event;
+    }
+    /// Asked once a frame, before the world is drawn (not on the title screen's panorama): set
+    /// [`WorldWarp`] to have the frame drawn through your warp. Mods are asked in order and one warp
+    /// draws: the last one set. Keep it cheap: compare and reuse your `Arc<str>`.
+    ///
+    /// Every mod gets `event.warp` in order and may add, change or remove warp.
+    fn world_warp(&self, event: &mut WorldWarpEvent<'_>) {
         let _ = event;
     }
 }
@@ -48,5 +56,16 @@ pub fn dispatch_hand_drawn(mods: &[&dyn RenderHooks], hand: &mut HandDrawn<'_>) 
     let mut event = HandDrawnEvent { hand };
     for mod_hook in mods {
         mod_hook.hand_drawn(&mut event);
+    }
+}
+/// What [`RenderHooks::world_warp`] is told. Fields may be added: the struct is `#[non_exhaustive]`.
+#[non_exhaustive]
+pub struct WorldWarpEvent<'a> {
+    pub warp: &'a mut WorldWarp,
+}
+pub fn dispatch_world_warp(mods: &[&dyn RenderHooks], warp: &mut WorldWarp) {
+    let mut event = WorldWarpEvent { warp };
+    for mod_hook in mods {
+        mod_hook.world_warp(&mut event);
     }
 }

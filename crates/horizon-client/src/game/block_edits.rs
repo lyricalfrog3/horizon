@@ -13,10 +13,38 @@ use horizon_client::{
     fast_hash::{FxHashMap, FxHashSet},
     world::World,
 };
+use horizon_world::nbt::Tag;
 use horizon_world::{
     heightmap::HeightmapType, registry::BlockStateId, worldgen::terrain::TerrainBlockStates,
 };
 use std::sync::Arc;
+
+/// SNBT of block entity data: a compound.
+pub(super) fn parse_block_entity_nbt(nbt: &str) -> Result<Tag, String> {
+    match horizon_world::nbt::parse_snbt(nbt) {
+        Ok((tag @ Tag::Compound(_), used)) if nbt[used..].trim().is_empty() => Ok(tag),
+        Ok(_) => Err("block entity NBT must be one compound".into()),
+        Err(e) => Err(e),
+    }
+}
+/// Whether `tag` may be loaded into a block entity of type `existing` (its saved `id`): its `id`, when it gives
+/// one, names that type, a missing namespace read as `minecraft:` (as `ResourceLocation` parses it).
+fn block_entity_id_fits(existing: &str, tag: &Tag) -> bool {
+    let full = |id: &str| {
+        let (namespace, path) = id.split_once(':').unwrap_or(("", id));
+        let namespace = if namespace.is_empty() {
+            "minecraft"
+        } else {
+            namespace
+        };
+        format!("{namespace}:{path}")
+    };
+    match tag.get("id") {
+        None => true,
+        Some(Tag::String(id)) => full(&id.to_string_lossy()) == full(existing),
+        Some(_) => false,
+    }
+}
 
 /// A change `World::edit_runs` reported: position, previous and new state.
 type Tracked = ((i32, i32, i32), u32, u32);
@@ -54,10 +82,24 @@ impl Game<'_> {
             .iter()
             .map(|f| parse(f, true))
             .collect::<Result<Vec<_>, _>>()?;
+        // (block entity data that doesn't read is refused whole, before anything changes; each is read once)
+        let block_entities = edit
+            .block_entities
+            .iter()
+            .map(|entry| {
+                parse_block_entity_nbt(&entry.nbt)
+                    .map(|tag| ([entry.x, entry.y, entry.z], tag))
+                    .map_err(|e| {
+                        format!("block entity at {} {} {}: {e}", entry.x, entry.y, entry.z)
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let runs = resolve_runs(edit, &palette, filters.len(), |h, x, z| {
             self.edit_height(h, x, z)
         })?;
         // (what the registry, the tags and the facts tell of a state, beside the world being changed)
+        self.ensure_stateful_entity_table();
+        let stateful = self.world.block_entities.stateful_entities();
         let registry = self.pack.assets.registry;
         // (the tags as `block_matches` reads them for commands)
         let world_items = match &self.world_tables {
@@ -81,20 +123,30 @@ impl Game<'_> {
                 let f = facts.get(BlockStateId(s));
                 watched.get(s as usize).copied().unwrap_or(false)
                     || f.block_entity
+                    || stateful.get(s as usize).copied().unwrap_or(false)
                     || BlockEntity::for_block(&f.name).is_some()
             },
         );
         self.world.watched = watched;
         // The block entities the new blocks bring, as `native_set_block` makes them (a mod block's own, API 15,
-        // included), in the order `replace_block_entities` takes them: the positions whose block changed.
+        // included), in the order `replace_block_entities` takes them: the positions needing a fresh entity.
         let name = |s: u32| self.res.facts().get(BlockStateId(s)).name.clone();
-        let wanted: Vec<Arc<str>> = out
+        let wanted: Vec<BlockStateId> = out
             .tracked
             .iter()
-            .filter(|&&(_, old, new)| name(old) != name(new))
-            .map(|&(_, _, new)| name(new))
+            .filter(|&&((x, y, z), old, new)| {
+                name(old) != name(new)
+                    || !self
+                        .world
+                        .block_entities
+                        .get(&(x, y, z))
+                        .is_some_and(|e| e.fits(&name(new)))
+            })
+            .map(|&(_, _, new)| BlockStateId(new))
             .collect();
-        let mut made = make_block_entities(&wanted, |n| self.new_block_entity(n)).into_iter();
+        let mut made =
+            make_block_entities(&wanted, |state| self.new_block_entity_for_state(*state))
+                .into_iter();
         let facts = self.res.facts();
         let removed = replace_block_entities(
             &mut self.world,
@@ -105,7 +157,64 @@ impl Game<'_> {
         for pos in removed {
             self.jukebox_removed(pos);
         }
+        // The block entity data, loaded as `BlockInput.place` loads it before the neighbours are told.
+        let given = block_entities.len();
+        let mut skipped = None;
+        for (pos, tag) in block_entities {
+            if !self.set_block_entity_checked(pos, tag) {
+                let (count, _) = skipped.get_or_insert((0, pos));
+                *count += 1;
+            }
+        }
+        if let Some((count, [x, y, z])) = skipped {
+            log::warn!(
+                "Horizon: mod block edit: {count} of {given} block entity entries skipped (no block entity of \
+                 that type there), the first at {x} {y} {z}"
+            );
+        }
+        if edit.neighbour_updates {
+            // `ServerLevel.updateNeighboursOnBlockSet` for each block changed, as `set_block` does with its flags.
+            for &((x, y, z), old, new) in &out.tracked {
+                if old == new {
+                    continue;
+                }
+                let at = horizon_core::position::BlockPos::new(x, y, z);
+                self.with_level(|b, level, ticks| {
+                    let block = b.block(BlockStateId(new));
+                    b.update_neighbors_at(level, ticks, at, block);
+                });
+            }
+            let _ = self.process_level_events();
+        }
         Ok(out.changed)
+    }
+
+    /// Load block entity data `tag` (a compound) into the block entity at `pos` as `/setblock ... {nbt}` does, only
+    /// when the block there has a block entity and `tag`'s `id`, if given, is that entity's type. False when
+    /// refused.
+    pub(super) fn set_block_entity_checked(&mut self, pos: [i32; 3], tag: Tag) -> bool {
+        // (the type the block entity saves as its `id`; a decorated pot's data is kept beside the model)
+        let existing = if self.pot_data(pos).is_some() {
+            "minecraft:decorated_pot".to_owned()
+        } else {
+            match self.world.block_entities.get(&(pos[0], pos[1], pos[2])) {
+                Some(e) => horizon_client::save::block_entity_id(e, &self.data_block_name(pos)),
+                None => return false,
+            }
+        };
+        if !block_entity_id_fits(&existing, &tag) {
+            return false;
+        }
+        // (an unchanged entity is still accepted: false means refused)
+        self.load_block_entity_tag(pos, tag);
+        true
+    }
+
+    /// The block entity part of `BlockInput.place` for SNBT: `load_block_entity_tag` once it reads; false when it
+    /// doesn't.
+    pub(super) fn load_block_entity_nbt(&mut self, pos: [i32; 3], nbt: &str) -> bool {
+        horizon_world::nbt::parse_snbt(nbt)
+            .is_ok_and(|(tag, _)| self.load_block_entity_tag(pos, tag))
     }
 
     /// Each column's height on `h` as `edit_height` reads it, none where its chunk is not loaded.
@@ -377,15 +486,15 @@ fn resolve_runs(
 /// A block entity for each new block, in order: made for each position, as vanilla calls
 /// `EntityBlock.newBlockEntity` for each (a mod's may number its instances). A block that makes none (stone) is
 /// asked once.
-fn make_block_entities(
-    names: &[Arc<str>],
-    mut make: impl FnMut(&str) -> Option<BlockEntity>,
+fn make_block_entities<S: Eq + std::hash::Hash>(
+    states: &[S],
+    mut make: impl FnMut(&S) -> Option<BlockEntity>,
 ) -> Vec<Option<BlockEntity>> {
-    let mut none: FxHashSet<&str> = FxHashSet::default();
-    names
+    let mut none: FxHashSet<&S> = FxHashSet::default();
+    states
         .iter()
         .map(|n| {
-            if none.contains(&**n) {
+            if none.contains(n) {
                 return None;
             }
             let entity = make(n);
@@ -413,6 +522,17 @@ fn replace_block_entities(
         let (was, now) = (name(old), name(new));
         if was != now {
             replaced.push([x, y, z]);
+        }
+        // LevelChunk.setBlockState: the entity at the position keeps its
+        // place only while it is valid for the block now there
+        // (`BlockEntity.isValidBlockState`); a mismatched or missing one
+        // makes way for the block's own.
+        if was != now
+            || !world
+                .block_entities
+                .get(&(x, y, z))
+                .is_some_and(|e| e.fits(&now))
+        {
             world.block_entities.remove(&(x, y, z));
             if let Some(entity) = new_entity(&now) {
                 world.block_entities.insert((x, y, z), entity);
@@ -444,6 +564,7 @@ mod tests {
             palette: vec!["stone".into(), "air".into()],
             filters: vec!["#dirt".into()],
             runs,
+            ..Default::default()
         }
     }
 
@@ -502,6 +623,34 @@ mod tests {
         assert_eq!((runs[0].y0, runs[0].y1), (i32::MAX, i32::MAX));
     }
 
+    #[test]
+    fn block_entity_nbt_must_be_one_compound() {
+        assert!(parse_block_entity_nbt("{Items:[]}").is_ok());
+        assert!(parse_block_entity_nbt(" {a:1b} ").is_ok());
+        assert!(parse_block_entity_nbt("[1,2]").is_err());
+        assert!(parse_block_entity_nbt("{a:1b} {b:2b}").is_err());
+        assert!(parse_block_entity_nbt("{Items:").is_err());
+    }
+
+    #[test]
+    fn block_entity_nbt_of_another_type_is_refused() {
+        let parse = |s: &str| parse_block_entity_nbt(s).unwrap();
+        let fits = |s: &str| block_entity_id_fits("minecraft:chest", &parse(s));
+        assert!(fits("{Items:[]}"));
+        assert!(fits("{id:\"minecraft:chest\"}"));
+        // `ResourceLocation` reads a missing namespace as minecraft's
+        assert!(fits("{id:\"chest\"}"));
+        assert!(fits("{id:\":chest\"}"));
+        assert!(!fits("{id:\"minecraft:furnace\"}"));
+        assert!(!fits("{id:\"furnace\"}"));
+        assert!(!fits("{id:\"machines:chest\"}"));
+        assert!(!fits("{id:1b}"));
+        assert!(block_entity_id_fits(
+            "machines:press",
+            &parse("{id:\"machines:press\"}")
+        ));
+    }
+
     fn world() -> World {
         let mut w = World::new(BlockStateId(0), 0);
         w.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
@@ -512,6 +661,8 @@ mod tests {
             0 => "minecraft:air",
             1 => "minecraft:stone",
             2 => "minecraft:chest",
+            // another chest state (a `facing` flip): the name is unchanged
+            4 => "minecraft:chest",
             _ => "machines:press",
         }
         .into()
@@ -573,6 +724,66 @@ mod tests {
         assert!(matches!(
             w.block_entities.get(&(3, 10, 3)),
             Some(BlockEntity::Mod(e)) if e.id == "machines:press"
+        ));
+    }
+
+    /// `LevelChunk.setBlockState` keeps an entity only while
+    /// `BlockEntity.isValidBlockState` holds: a stale one goes for the
+    /// block's own (a sculk listener spilled under a same-name write), and
+    /// a fitting one survives a same-name write (a chest's items stay).
+    #[test]
+    fn a_kept_block_entity_must_fit_its_block() {
+        let sculk = BlockEntity::for_block("minecraft:sculk_sensor").expect("a sensor's");
+        let chest = BlockEntity::for_block("minecraft:chest").expect("a chest's");
+        assert!(!sculk.fits("minecraft:stone"));
+        assert!(chest.fits("minecraft:chest"));
+        // a 27-slot container never fits a hopper's five
+        assert!(!chest.fits("minecraft:hopper"));
+
+        let mut w = world();
+        w.set(1, 5, 1, BlockStateId(2)).unwrap();
+        w.block_entities.insert((1, 5, 1), sculk);
+        let out = w.edit_runs(
+            &[Run {
+                x: 1,
+                z: 1,
+                y0: 5,
+                y1: 5,
+                state: 4,
+                only: None,
+            }],
+            |_, _| true,
+            |_| true,
+        );
+        assert_eq!(out.tracked, [((1, 5, 1), 2, 4)]);
+        replace_block_entities(&mut w, &out.tracked, names, BlockEntity::for_block);
+        assert!(
+            matches!(
+                w.block_entities.get(&(1, 5, 1)),
+                Some(BlockEntity::Chest(_))
+            ),
+            "the chest's own entity replaces the spilled sculk one"
+        );
+
+        w.set(2, 5, 1, BlockStateId(2)).unwrap();
+        w.block_entities.insert((2, 5, 1), chest);
+        let out = w.edit_runs(
+            &[Run {
+                x: 2,
+                z: 1,
+                y0: 5,
+                y1: 5,
+                state: 4,
+                only: None,
+            }],
+            |_, _| true,
+            |_| true,
+        );
+        assert_eq!(out.tracked, [((2, 5, 1), 2, 4)]);
+        replace_block_entities(&mut w, &out.tracked, names, BlockEntity::for_block);
+        assert!(matches!(
+            w.block_entities.get(&(2, 5, 1)),
+            Some(BlockEntity::Chest(_))
         ));
     }
 
@@ -687,7 +898,7 @@ mod tests {
             .map(Arc::<str>::from),
             |n| {
                 calls.push(n.to_string());
-                (n == "machines:press").then(|| {
+                (n.as_ref() == "machines:press").then(|| {
                     BlockEntity::Mod(Box::new(
                         horizon_client::containers::ModBlockEntityFields {
                             id: format!("press-{}", calls.len()),
@@ -719,4 +930,29 @@ mod tests {
             ["machines:press", "minecraft:stone", "machines:press"]
         );
     }
+    #[test]
+    fn null_factories_are_cached_per_state_not_per_block_name() {
+        // One block can create no BE in one state and a BE in another.
+        // A cached null for the first state must not suppress the second.
+        let mut calls = Vec::new();
+        let made = make_block_entities(&[7_u32, 8, 7, 8], |state| {
+            calls.push(*state);
+            (*state == 8).then(|| {
+                BlockEntity::Mod(Box::new(
+                    horizon_client::containers::ModBlockEntityFields {
+                        id: "machines:heater".into(),
+                        ..Default::default()
+                    }
+                    .into(),
+                ))
+            })
+        });
+        assert_eq!(calls, [7, 8, 8]);
+        assert!(made[0].is_none() && made[2].is_none());
+        assert!(made[1].is_some() && made[3].is_some());
+    }
 }
+
+#[cfg(test)]
+#[path = "block_edit_nbt_tests.rs"]
+mod block_edit_nbt_tests;

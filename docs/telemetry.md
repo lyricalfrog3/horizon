@@ -2,7 +2,10 @@
 
 Horizon collects nothing unless the player says yes. The launcher asks once, with four separate switches that are all off until the player turns one on, and the same switches stay in Settings. The game and the launcher obey the same answer. The code is in `crates/horizon-telemetry`.
 
-The one exception is the anonymous ["I'm playing" ping](#the-im-playing-ping) behind the launcher's "N playing now": it holds nothing about the player, and the launcher says so next to the switches.
+Two exceptions:
+
+- The anonymous ["I'm playing" ping](#the-im-playing-ping) behind the launcher's "N playing now": it holds nothing about the player, and the launcher says so next to the switches.
+- The cosmetics service's *Show me as Horizon* (Extras › Cosmetics, on by default): a signed-in account tells the cosmetics service, at start and then every hour, that it plays Horizon, so other Horizon players see the Horizon mark beside its name. The service reports it for 3 hours, and anyone can ask it whether an account played Horizon in that window. Turning the setting off makes the service forget the account at once. It is not part of telemetry and the switches above don't cover it: see [cosmetics.md](cosmetics.md).
 
 ## Consent
 
@@ -72,7 +75,7 @@ Never sent: account names or UUIDs, world names, server or LAN addresses, chat, 
 
 Ludovic decided on 2026-10-22 to count every player, with or without consent, and to tell them. The launcher's first-run question and Settings → Data collection show it as an "Always on" row next to the switches. Players who answered the question before the ping existed see the same text once on the Play page. The privacy page on playhorizon.dev says the same.
 
-While the game runs (not a dedicated server, a benchmark or a run that quits by itself), a thread of its own (`crates/horizon-client/src/heartbeat.rs`) sends `POST /v1/live` once a minute. It also sends one at once when a world is opened to or closed from LAN or friends:
+While the game runs (not a dedicated server, a benchmark or a run that quits by itself), a thread of its own (`crates/horizon-heartbeat`, which the official executable plugs into the game) sends `POST /v1/live` once a minute. It also sends one at once when a world is opened to or closed from LAN or friends:
 
 ```json
 { "session": "9b1c…", "version": "v2026.10.22", "platform": "macos", "lan": false }

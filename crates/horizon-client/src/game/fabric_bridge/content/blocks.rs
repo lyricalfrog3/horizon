@@ -22,7 +22,7 @@
 //!   class has is left out: a template of other states would not be it.
 //!
 //! The declared numbers are the block's own: hardness, blast resistance,
-//! light, tool need, friction, map colour, sounds, `can_occlude` and its
+//! light, tool need, friction, map colour, sounds, `occludes` and its
 //! outline and collision boxes per state. What a declaration cannot say
 //! (per-state hardness or light, a block entity, the class's own code) goes
 //! into the block's notes for the log.
@@ -525,7 +525,7 @@ pub(super) fn declare(block: &RegisteredBlock, vanilla: &Vanilla) -> Result<Decl
     }
     let template_occludes = theirs.is_some_and(|s| s.can_occlude);
     if !ours.can_occlude && template_occludes {
-        properties.insert("can_occlude".into(), json!(false));
+        properties.insert("occludes".into(), json!(false));
     } else if ours.can_occlude && !template_occludes {
         notes.push("it occludes, and its template does not".into());
     }
@@ -618,7 +618,7 @@ pub(super) fn declare(block: &RegisteredBlock, vanilla: &Vanilla) -> Result<Decl
             }
             file.insert("shapes".into(), shape_map(&outline, &names));
             if collision != outline {
-                file.insert("collision".into(), shape_map(&collision, &names));
+                file.insert("collision_shapes".into(), shape_map(&collision, &names));
             }
         }
         _ => notes.push("its shapes were not read; the template's are kept".into()),
@@ -744,7 +744,7 @@ fn shape_map(by_state: &BTreeMap<String, Vec<[f64; 6]>>, names: &[String]) -> Va
         by_state.iter().map(|(k, b)| (parse_key(k), b)).collect();
     let project = |keep: &[String], props: &BTreeMap<String, String>| -> String {
         keep.iter()
-            .map(|n| format!("{n}={}", props.get(n).map_or("", String::as_str)))
+            .map(|n| props.get(n).map_or("", String::as_str).to_owned())
             .collect::<Vec<_>>()
             .join(",")
     };
@@ -762,6 +762,10 @@ fn shape_map(by_state: &BTreeMap<String, Vec<[f64; 6]>>, names: &[String]) -> Va
         if decides(&without) {
             keep = without;
         }
+    }
+    // Every state has the same boxes: one shape for all.
+    if keep.is_empty() {
+        return json!({"default": states.first().map(|(_, b)| (*b).clone()).unwrap_or_default()});
     }
     let mut values = Map::new();
     for (props, b) in &states {
@@ -996,7 +1000,7 @@ mod tests {
         assert_eq!(json["properties"]["hardness"], 1.5);
         assert_eq!(json["properties"]["explosion_resistance"], 10.0);
         assert_eq!(json["properties"]["map_color"], 13);
-        assert_eq!(json["properties"]["can_occlude"], false);
+        assert_eq!(json["properties"]["occludes"], false);
         assert_eq!(
             json["state_properties"],
             json!({"facing": {"type": "enum", "values": ["north", "south", "west", "east"]}})
@@ -1011,7 +1015,7 @@ mod tests {
                 "east": [[0.0, 0.0, 0.0, 0.6875, 1.0, 1.0]]}})
         );
         // Collision equals the outline, so it is not repeated.
-        assert!(json.get("collision").is_none());
+        assert!(json.get("collision_shapes").is_none());
         // Its item is the block's, with the BlockItem's components.
         assert!(json.get("item").is_none());
         assert_eq!(json["components"], json!({"minecraft:max_stack_size": 16}));
@@ -1235,10 +1239,10 @@ mod tests {
         // One shape for every state, from the facts.
         assert_eq!(
             json["shapes"],
-            json!({"properties": [], "values": {"": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]}})
+            json!({"default": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]})
         );
         // The bed does not occlude, so nothing is said about it.
-        assert!(json["properties"].get("can_occlude").is_none());
+        assert!(json["properties"].get("occludes").is_none());
         assert!(json["properties"].get("sounds").is_none());
     }
 
@@ -1314,8 +1318,8 @@ mod tests {
                 "false": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]}})
         );
         assert_eq!(
-            json["collision"],
-            json!({"properties": [], "values": {"": []}})
+            json["collision_shapes"],
+            json!({"default": []})
         );
         // Light differs per state: the default's (unlit) is declared, and said.
         assert_eq!(json["properties"]["light"], 0);
