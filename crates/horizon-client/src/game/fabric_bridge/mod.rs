@@ -305,6 +305,20 @@ impl hfc_runtime::bridge::HostBridge for HostBridgeAdapter<'_, '_> {
     fn held_item(&self) -> Option<String> {
         self.0.held().map(|s| s.item.to_string())
     }
+    fn inventory(&self) -> Vec<Option<(String, i32)>> {
+        // Vanilla's `Inventory` order: the 36 main slots (hotbar last), then
+        // the off hand. A screen's player slots are laid out in that order.
+        self.0
+            .inventory
+            .iter()
+            .map(|stack| {
+                stack
+                    .as_ref()
+                    .map(|stack| (stack.item.to_string(), stack.count as i32))
+                    .filter(|(item, count)| *count > 0 && item != "minecraft:air")
+            })
+            .collect()
+    }
     fn off_hand_item(&self) -> Option<String> {
         self.0.offhand.as_ref().map(|s| s.item.to_string())
     }
