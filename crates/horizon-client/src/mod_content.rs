@@ -1390,10 +1390,7 @@ impl<'a> Plan<'a> {
                     }
                     if let Some(shapes) = b.collision_shapes.as_ref().or(b.shapes.as_ref()) {
                         let shape = &shapes[state_index];
-                        row.set(
-                            "full_collision",
-                            J::Bool(full_block(shape)?),
-                        );
+                        row.set("full_collision", J::Bool(full_block(shape)?));
                     }
                     self.occlusion_facts(b, state_index, &mut row)?;
                 }

@@ -1317,10 +1317,7 @@ mod tests {
                 "true": [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]],
                 "false": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]}})
         );
-        assert_eq!(
-            json["collision_shapes"],
-            json!({"default": []})
-        );
+        assert_eq!(json["collision_shapes"], json!({"default": []}));
         // Light differs per state: the default's (unlit) is declared, and said.
         assert_eq!(json["properties"]["light"], 0);
         assert!(

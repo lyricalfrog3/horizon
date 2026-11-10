@@ -961,7 +961,9 @@ impl Content {
             // tags and atlases, and to the convention tags mods share.
             let shared = matches!(namespace, "minecraft" | "c");
             let atlas = top == "assets" && namespace == "minecraft" && rest.starts_with("atlases/");
-            let allowed = owned || (top == "data" && shared && rest.starts_with("tags/")) || atlas
+            let allowed = owned
+                || (top == "data" && shared && rest.starts_with("tags/"))
+                || atlas
                 || (top == "assets" && namespace == "minecraft" && worn_equipment(rest));
             if !allowed {
                 return Err(format!(

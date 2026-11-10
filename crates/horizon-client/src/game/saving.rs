@@ -30,6 +30,7 @@ const SNAPSHOT_BUDGET: Duration = Duration::from_millis(2);
 
 impl Game<'_> {
     pub(super) fn begin_closing_save(&mut self, quit: bool) -> Result<()> {
+        self.fabric_save_block_entities();
         if quit {
             // `Minecraft.close`: the friends service sends its offline presence
             // before the game ends.
@@ -105,6 +106,7 @@ impl Game<'_> {
         if self.pending_save.is_some() {
             return Err("a world save is already in progress".into());
         }
+        self.fabric_save_block_entities();
         if all {
             self.world
                 .modified
@@ -288,6 +290,9 @@ impl Game<'_> {
 
     /// Save the level in place: its changed chunks, its entities and its raids.
     pub(super) fn save_level(&mut self, wait: bool) -> Result<()> {
+        // The Fabric block entities' own saved state goes into the world's
+        // entities before the chunks are snapshotted.
+        self.fabric_save_block_entities();
         self.save_border();
         self.save.save_attachments(&self.world.attachments)?;
         self.save

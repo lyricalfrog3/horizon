@@ -201,6 +201,11 @@ impl BlockEntities {
     pub fn set_mod_containers(&mut self, containers: FxHashMap<u32, Arc<ModContainer>>) {
         self.mod_containers = containers;
     }
+    /// The per-state mod container table, for a caller that adds one entry
+    /// (`Game::open_fabric_menu`).
+    pub fn mod_containers(&self) -> &FxHashMap<u32, Arc<ModContainer>> {
+        &self.mod_containers
+    }
     /// The container of a mod block's block entity in block state `state`.
     pub fn mod_container(&self, state: u32) -> Option<&Arc<ModContainer>> {
         self.mod_containers.get(&state)

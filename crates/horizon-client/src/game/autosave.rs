@@ -4,6 +4,9 @@ use super::*;
 
 impl Game<'_> {
     pub(super) fn save_game(&mut self) -> Result<()> {
+        // The Fabric block entities' own saved state goes into the world's
+        // entities before the chunks are snapshotted.
+        self.fabric_save_block_entities();
         self.save_game_with(true)
     }
     /// `MinecraftServer.computeNextAutosaveInterval`: three hundred seconds

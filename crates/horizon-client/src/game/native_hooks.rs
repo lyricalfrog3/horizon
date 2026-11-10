@@ -12020,6 +12020,18 @@ impl Game<'_> {
                 .into(),
             )));
         }
+        // A block a Fabric mod registered in code whose block entity is its
+        // own (a cooking pot): the host keeps a `ModBlockEntity` of the block's
+        // id beside it, which is where its saved tree goes.
+        if self.fabric_has_block_entity(name) {
+            return Some(BlockEntity::Mod(Box::new(
+                ModBlockEntityFields {
+                    id: name.to_owned(),
+                    ..Default::default()
+                }
+                .into(),
+            )));
+        }
         let mut entity = None;
         self.native_block_entity(name, &mut entity);
         let (id, nbt) = entity?;

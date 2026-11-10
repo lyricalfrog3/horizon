@@ -2259,6 +2259,9 @@ struct Game<'a> {
     /// took is still there, so a half of a double chest (or the container)
     /// going away closes it.
     open_container_slots: Option<((i32, i32, i32), usize)>,
+    /// The Fabric block whose own menu is open, its title, and the slots that
+    /// take a stack (`Game::open_fabric_menu`).
+    fabric_menu: Option<((i32, i32, i32), String, String, Vec<usize>)>,
     /// Open workstation menu (enchanting table, anvil, ...).
     station: Option<stations::Station>,
     /// Status effects and thrown potions (game/potions.rs).
@@ -5674,6 +5677,11 @@ impl Game<'_> {
             // The block ticks Fabric block code scheduled, beside the level's
             // own scheduled ticks.
             horizon_client::spans::time("tick_fabric_blocks", || self.tick_fabric_blocks());
+            // The Fabric blocks' own block entities (a pot's cooking tick), each
+            // run through the block's real `getTicker`.
+            horizon_client::spans::time("tick_fabric_block_entities", || {
+                self.tick_fabric_block_entities()
+            });
             // What the blocks spawned (a dispensed minecart, a lit TNT, a
             // placed boat) joins before the entities tick.
             self.native_joins_flush(false, 0);
@@ -6426,12 +6434,22 @@ impl Game<'_> {
                     };
                     part(batch, tex, 0.0, 0.0, 176.0, 166.0, ox, oy);
                     // A server's furnace menu has the title it was given.
-                    let title = self.remote_menu_title().unwrap_or_else(|| {
-                        horizon_client::text::Text::literal(
-                            self.container_title(self.translate(key, fallback)),
-                        )
-                        .resolve_legacy()
-                    });
+                    // A Fabric block's own menu carries the title its
+                    // `getDisplayName` answered.
+                    let title = self
+                        .fabric_menu
+                        .as_ref()
+                        .filter(|(open, ..)| self.container == Some(*open))
+                        .map(|(_, _, title, _)| {
+                            horizon_client::text::Text::literal(title.clone()).resolve_legacy()
+                        })
+                        .or_else(|| self.remote_menu_title())
+                        .unwrap_or_else(|| {
+                            horizon_client::text::Text::literal(
+                                self.container_title(self.translate(key, fallback)),
+                            )
+                            .resolve_legacy()
+                        });
                     screen_info::name_container(|| title.plain());
                     let tw = atlas.font.width_text(&title);
                     batch.text_styled(
@@ -11958,6 +11976,7 @@ impl<'a> Game<'a> {
             last_quick_moved: None,
             container: None,
             open_container_slots: None,
+            fabric_menu: None,
             station: None,
             potions: Default::default(),
             scratch_slot: None,

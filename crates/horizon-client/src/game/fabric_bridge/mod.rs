@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+mod block_entity_nbt;
 mod content;
 mod gui;
 mod keys;
@@ -470,6 +471,109 @@ impl Game<'_> {
                 *canceled = true;
             }
         }
+        // A block that makes a block entity has one once it is used, even if
+        // its use did not run: vanilla's chunk holds it either way.
+        self.fabric_ensure_block_entity(pos);
+        // The menu its own code opened (`Player.openMenu`) is shown over the
+        // world; its slots are the mod's own inventory, read and written
+        // through this bridge so a tick sees what the player put in.
+        let opened = match get_fabric_bridge().lock() {
+            Ok(mut bridge) => bridge.take_opened_menu(),
+            Err(_) => None,
+        };
+        if let Some((block, menu)) = opened {
+            self.open_fabric_menu(pos, &block, menu);
+        }
+    }
+
+    /// Show the menu a Fabric block's own code opened (`Player.openMenu`).
+    ///
+    /// When the client knows the menu type's own screen (a `MenuScreens`
+    /// entry), the menu's `setScreen` already installed it (the mod's real
+    /// screen, e.g. a pot's `CookingPotScreen`), built by the client's
+    /// registered constructor for the menu's `getType`. The host then follows
+    /// that real screen instead of drawing a `MOD_MENUS` grid, and leaves the
+    /// mod's block entity as the source of its items: the real screen writes
+    /// its own inventory on a click, and the block's own `saveAdditional`
+    /// (run by [`Game::fabric_save_block_entities`]) persists it.
+    ///
+    /// When the client has no screen for the menu type, the host draws a
+    /// vanilla grid for the slot count; its slots are the mod's own inventory,
+    /// kept in step with it: a click writes the block entity's item list, and
+    /// [`Game::fabric_sync_menu_items`] copies that into the mod's inventory
+    /// before its code runs.
+    fn open_fabric_menu(
+        &mut self,
+        pos: [i32; 3],
+        block: &str,
+        menu: hfc_runtime::bridge::OpenedMenu,
+    ) {
+        // The menu's `setScreen` installed the mod's own screen (a
+        // `MenuScreens` entry for the menu type): follow it rather than draw a
+        // host grid, and leave the mod's block entity as the source of its
+        // items. Slot count is irrelevant here: the real screen renders itself.
+        if get_fabric_bridge()
+            .lock()
+            .is_ok_and(|bridge| bridge.has_screen())
+        {
+            log::debug!("Fabric: {block}'s menu opened its own screen; the host follows it");
+            self.fabric_follow_screen();
+            self.right = false;
+            return;
+        }
+        let slots = menu.slots;
+        if slots == 0 {
+            return;
+        }
+        // The host screen draws a vanilla grid for the slot count; a menu with
+        // no such grid is not shown rather than drawn wrongly.
+        let Some((menu_id, grid)) = crate::containers::MOD_MENUS
+            .into_iter()
+            .find(|(_, size)| *size == slots)
+        else {
+            log::warn!("Fabric: {block}'s menu has {slots} slots, which no host menu draws");
+            return;
+        };
+        let key = (pos[0], pos[1], pos[2]);
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let inputs = menu.input.clone();
+        let container = std::sync::Arc::new(crate::containers::ModContainer {
+            slots: grid,
+            max_stack: 64,
+            faces: std::array::from_fn(|_| (0..grid).collect()),
+            inputs: inputs.clone(),
+            outputs: (0..grid).filter(|i| !inputs.contains(i)).collect(),
+            menu: Some(menu_id.to_string()),
+        });
+        let mut table = self.world.block_entities.mod_containers().clone();
+        table.insert(state.0, std::sync::Arc::clone(&container));
+        self.world.block_entities.set_mod_containers(table);
+        let mut items: Vec<Option<ItemStack>> = menu
+            .items
+            .iter()
+            .map(|slot| {
+                slot.as_ref()
+                    .map(|(item, count)| ItemStack::new(item, *count as u32))
+            })
+            .collect();
+        items.resize(grid, None);
+        self.world.block_entities.insert(
+            key,
+            crate::containers::BlockEntity::Mod(Box::new(
+                crate::containers::ModBlockEntityFields {
+                    id: block.to_owned(),
+                    items,
+                    ..Default::default()
+                }
+                .into(),
+            )),
+        );
+        self.container = Some(key);
+        self.open_container_slots = Some((key, grid));
+        self.fabric_menu = Some((key, block.to_owned(), menu.title, inputs));
+        self.screen = crate::game::Screen::Inventory;
+        self.capture(false);
+        self.right = false;
     }
 
     /// A player placed a Fabric block: run the block's own `onPlace` and
@@ -526,7 +630,12 @@ impl Game<'_> {
         let result = match bridge.lock() {
             Ok(mut bridge) => {
                 let adapter = HostBridgeAdapter(self);
-                bridge.block_placed(&adapter, &request, &properties)
+                let placed = bridge.block_placed(&adapter, &request, &properties);
+                // A block that makes a block entity has one from the start, as
+                // vanilla's `Level.setBlock` does: its own code (`setPlacedBy`,
+                // a later use or tick) reads it.
+                bridge.ensure_block_entity(&adapter, target, &block);
+                placed
             }
             Err(_) => return,
         };
@@ -646,6 +755,182 @@ impl Game<'_> {
                 self.schedule_fabric_tick([pos.x, pos.y, pos.z], &block, 1);
             }
         }
+    }
+
+    /// Whether a Fabric mod registered `name` in code and its block makes a
+    /// block entity: the host gives such a block a `ModBlockEntity` of its own
+    /// id, which saves the runtime's tree under `HorizonFabric`.
+    pub(super) fn fabric_has_block_entity(&self, name: &str) -> bool {
+        let Some(bridge) = started_fabric_bridge() else {
+            return false;
+        };
+        let Ok(bridge) = bridge.lock() else {
+            return false;
+        };
+        bridge.block_entity_declared(name)
+    }
+
+    /// Make the block entity a Fabric block's own code expects at `pos`: the
+    /// mod's real `BlockEntity` object, kept in the runtime, so its own use and
+    /// tick code can read it (`Level.getBlockEntity` answers it).
+    /// Write every kept Fabric block entity's own saved state into the world's
+    /// block entities before a chunk is snapshotted, so the pot's contents and
+    /// cook progress are in the world it saves.
+    pub(super) fn fabric_save_block_entities(&mut self) {
+        if self.serving.is_none() && self.options.dedicated.is_none() {
+            return;
+        }
+        let Some(bridge) = started_fabric_bridge() else {
+            return;
+        };
+        let kept: Vec<([i32; 3], String)> = match bridge.lock() {
+            Ok(bridge) => bridge.kept_block_entity_positions(),
+            Err(_) => return,
+        };
+        for (pos, block) in kept {
+            if self
+                .pack
+                .assets
+                .registry
+                .state(self.world.block(pos[0], pos[1], pos[2]))
+                .map(|state| state.name.as_str())
+                != Some(block.as_str())
+            {
+                continue;
+            }
+            let Some(values) = self.fabric_save_block_entity(pos) else {
+                continue;
+            };
+            let key = (pos[0], pos[1], pos[2]);
+            // `ModBlockEntity` is read and changed through its fields
+            // (`DerefMut`), so a write gives it a new revision.
+            if let Some(crate::containers::BlockEntity::Mod(entity)) =
+                self.world.block_entities.get_mut(&key)
+            {
+                entity.nbt.insert(
+                    block_entity_nbt::KEY.into(),
+                    horizon_world::nbt::Tag::Compound(block_entity_nbt::to_nbt(&values)),
+                );
+            }
+        }
+    }
+
+    pub(super) fn fabric_ensure_block_entity(&mut self, pos: [i32; 3]) {
+        let Some(block) = self
+            .pack
+            .assets
+            .registry
+            .state(self.world.block(pos[0], pos[1], pos[2]))
+            .map(|state| state.name.to_string())
+        else {
+            return;
+        };
+        let Some(bridge) = started_fabric_bridge() else {
+            return;
+        };
+        let Ok(mut bridge) = bridge.lock() else {
+            return;
+        };
+        if !bridge.is_registered_block(&block) {
+            return;
+        }
+        let mut adapter = HostBridgeAdapter(self);
+        bridge.ensure_block_entity(&adapter, pos, &block);
+    }
+
+    /// Tick the Fabric blocks' block entities: each kept entity whose block
+    /// declares a ticker runs its own `cookingTick`-style tick, and what it
+    /// changed is applied through the host.
+    pub(super) fn tick_fabric_block_entities(&mut self) {
+        if self.serving.is_none() && self.options.dedicated.is_none() {
+            return;
+        }
+        let Some(bridge) = started_fabric_bridge() else {
+            return;
+        };
+        let Ok(mut bridge) = bridge.lock() else {
+            return;
+        };
+        if bridge.kept_block_entity_count() == 0 {
+            return;
+        }
+        // What the player put in an open Fabric menu goes into the mod's own
+        // inventory first, so this tick reads it (the pot's cooking tick takes
+        // its ingredients from there).
+        for (pos, block) in self.fabric_menu_items() {
+            let key = (pos[0], pos[1], pos[2]);
+            let Some(crate::containers::BlockEntity::Mod(entity)) =
+                self.world.block_entities.get(&key)
+            else {
+                continue;
+            };
+            let items: Vec<Option<(String, i32)>> = entity
+                .items
+                .iter()
+                .map(|stack| {
+                    stack
+                        .as_ref()
+                        .map(|stack| (stack.item.to_string(), stack.count as i32))
+                        .filter(|(item, count)| *count > 0 && item != "minecraft:air")
+                })
+                .collect();
+            bridge.sync_menu_items(pos, &block, &items);
+        }
+        let mut adapter = HostBridgeAdapter(self);
+        bridge.tick_block_entities(&mut adapter);
+    }
+
+    /// The position and block of every open Fabric menu (`Game::fabric_menu`).
+    fn fabric_menu_items(&self) -> Vec<([i32; 3], String)> {
+        self.fabric_menu
+            .as_ref()
+            .map(|(key, block, ..)| (([key.0, key.1, key.2]), block.clone()))
+            .into_iter()
+            .collect()
+    }
+
+    /// The block entity's own saved state, for the host to store with the
+    /// block, and a load back into a fresh entity when the chunk comes in.
+    pub(super) fn fabric_save_block_entity(
+        &mut self,
+        pos: [i32; 3],
+    ) -> Option<Vec<(String, hfc_runtime::value_io_builtins::StoredValue)>> {
+        let block = self
+            .pack
+            .assets
+            .registry
+            .state(self.world.block(pos[0], pos[1], pos[2]))
+            .map(|state| state.name.to_string())?;
+        let bridge = started_fabric_bridge()?;
+        let mut bridge = bridge.lock().ok()?;
+        bridge.save_block_entity(pos, &block)
+    }
+
+    pub(super) fn fabric_load_block_entity(
+        &mut self,
+        pos: [i32; 3],
+        values: Vec<(String, hfc_runtime::value_io_builtins::StoredValue)>,
+    ) {
+        let Some(block) = self
+            .pack
+            .assets
+            .registry
+            .state(self.world.block(pos[0], pos[1], pos[2]))
+            .map(|state| state.name.to_string())
+        else {
+            return;
+        };
+        let Some(bridge) = started_fabric_bridge() else {
+            return;
+        };
+        let Ok(mut bridge) = bridge.lock() else {
+            return;
+        };
+        if !bridge.is_registered_block(&block) {
+            return;
+        }
+        let mut adapter = HostBridgeAdapter(self);
+        bridge.load_block_entity(&adapter, pos, &block, values);
     }
 
     pub(super) fn fabric_tooltip(&self, stack: &ItemStack, lines: &mut Vec<(Text, u32)>) {
