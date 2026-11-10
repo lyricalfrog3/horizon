@@ -105,15 +105,18 @@ pub(super) fn upload_fabric_textures(
     }
 }
 
-/// Cap a mod icon at 64 px per side: the list draws it at 32 GUI pixels and
-/// the run-time atlas region is shared with rasterized glyphs.
+/// Cap a texture at the run-time atlas region's rows, the tallest image it can
+/// hold. A mod icon is drawn at 32 GUI pixels and loses nothing at 64, but a
+/// screen background is blitted at its own size and every texel of it is
+/// sampled: shrinking a 256x256 GUI sheet to 64 made a pot's screen blurry and
+/// shifted its sub-rects (the heat bar samples a 1 px stripe of it).
 pub(super) fn fit_texture(width: u32, height: u32, rgba: Vec<u8>) -> (u32, u32, Vec<u8>) {
-    const MAX: u32 = 64;
+    let max = horizon_client::hud::GLYPH_ROWS;
     let longest = width.max(height);
-    if longest <= MAX || width == 0 || height == 0 {
+    if longest <= max || width == 0 || height == 0 {
         return (width, height, rgba);
     }
-    let scale = f64::from(MAX) / f64::from(longest);
+    let scale = f64::from(max) / f64::from(longest);
     let new_width = ((f64::from(width) * scale).round() as u32).max(1);
     let new_height = ((f64::from(height) * scale).round() as u32).max(1);
     let mut out = Vec::with_capacity((new_width * new_height * 4) as usize);
@@ -136,4 +139,40 @@ pub(super) fn texture_initial(name: &str) -> Option<String> {
     stem.chars()
         .find(|c| c.is_alphanumeric())
         .map(|c| c.to_uppercase().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_texture;
+
+    fn opaque(width: u32, height: u32) -> Vec<u8> {
+        vec![255; (width * height * 4) as usize]
+    }
+
+    /// A screen's GUI background is blitted at its own size and sampled
+    /// texel by texel (a pot's 176x166 panel out of a 256x256 sheet, and a
+    /// 1 px heat bar out of it). Shrinking the sheet made the screen look
+    /// blurry and put its sub-rects in the wrong place.
+    #[test]
+    fn a_screen_background_keeps_its_texels() {
+        let (width, height, pixels) = fit_texture(256, 256, opaque(256, 256));
+        assert_eq!(
+            (width, height),
+            (256, 256),
+            "a GUI sheet is drawn texel for texel and must not be shrunk"
+        );
+        assert_eq!(pixels.len(), 256 * 256 * 4);
+    }
+
+    /// The atlas region is finite, so an image taller than it still has to
+    /// give way; it stays proportional.
+    #[test]
+    fn an_image_taller_than_the_region_keeps_its_ratio() {
+        let region = horizon_client::hud::GLYPH_ROWS;
+        let (width, height, pixels) =
+            fit_texture(region * 2, region * 4, opaque(region * 2, region * 4));
+        assert_eq!(height, region, "the tallest side is capped at the region");
+        assert_eq!(width, region / 2, "the other side keeps the ratio");
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
+    }
 }
